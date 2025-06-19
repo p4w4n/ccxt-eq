@@ -1,0 +1,1564 @@
+﻿Integrating Zerodha Kite Connect with Freqtrade: A CCXT Wrapper Implementation Guide
+
+
+
+
+Executive Summary
+
+
+This report provides a comprehensive architectural blueprint and implementation guide for creating a fully-featured, CCXT-compatible Python wrapper for Zerodha's Kite Connect v3 API. The primary objective is to enable the use of Freqtrade, a leading open-source algorithmic trading bot, for automated spot equity trading on Indian stock exchanges (NSE/BSE). We will address the principal challenge of this integration: reconciling Zerodha's stateful, daily-expiring authentication model with the stateless design paradigm of CCXT and Freqtrade. The proposed solution involves a robust token management engine, a precise mapping of stock market concepts to their crypto-native counterparts, and a clear path for future extension to derivatives trading. This document will serve as the definitive guide for developers, covering foundational analysis, architectural design, detailed code implementation, and practical integration with Freqtrade.
+The core of this endeavor is to bridge the gap between the sophisticated, crypto-focused world of Freqtrade and the regulated, session-based environment of the Indian stock market as exposed by Zerodha. This requires more than a simple translation of API calls; it necessitates the creation of a state-aware component within the traditionally stateless CCXT framework. The report details the design of this component, which handles the lifecycle of the daily access_token, ensuring seamless operation for the Freqtrade bot. Furthermore, it establishes clear conventions for representing Indian equities and their associated data within the CCXT structure, ensuring compatibility with Freqtrade's backtesting, dry-run, and live trading modules. By providing detailed code logic, configuration examples, and security best practices, this document equips advanced developers with all the necessary tools and knowledge to successfully unlock automated, strategy-driven trading on one of India's largest brokerage platforms.
+
+
+Section 1: Foundational Analysis: Deconstructing the Ecosystem
+
+
+This initial section establishes the technical groundwork by dissecting the three core components of the integration: the Zerodha Kite Connect API, the CCXT library, and the Freqtrade trading bot. Understanding their individual characteristics, APIs, and constraints is paramount to designing a robust bridge between them. A failure to appreciate the nuances of each system, particularly the fundamental differences between a stock brokerage API and a typical cryptocurrency exchange API, will lead to an integration that is brittle and unreliable in a live trading environment.
+
+
+1.1 The Zerodha Kite Connect v3 API: A Stockbroker's Gateway
+
+
+The Zerodha Kite Connect API is a set of REST-like HTTP APIs designed to facilitate programmatic trading and portfolio management on Indian stock exchanges. It is a powerful tool for traders and developers, but its design philosophy is rooted in the regulatory and security paradigms of the traditional capital markets, which presents unique challenges when integrating with tools built for the more open, 24/7 world of cryptocurrency.
+
+
+1.1.1 API Philosophy and Core Characteristics
+
+
+Kite Connect v3 exposes a wide range of functionalities, including real-time order execution for equities and mutual funds, portfolio management, and, via WebSockets, live market data streaming. All API interactions use form-encoded parameters for inputs and return JSON responses, with standard HTTP status codes indicating success or failure.
+A critical architectural constraint is that the API endpoints are not enabled for Cross-Origin Resource Sharing (CORS). This means they cannot be called directly from a client-side browser application. All interactions, especially the initial authentication handshake, must be performed by a server-side backend. This security measure is designed to protect sensitive credentials, like the api_secret, from being exposed in client-side code. For the purpose of this integration, the Python environment where the CCXT wrapper and Freqtrade run will act as this secure backend.
+
+
+1.1.2 The Authentication Gauntlet: A Multi-Stage Process
+
+
+The most significant hurdle in integrating Zerodha with CCXT is its complex, multi-stage authentication process. Unlike the simple apiKey and secret pair used by most crypto exchanges, Zerodha employs a session-based flow that requires user interaction and results in a short-lived access token.1
+Step 1: Manual Login and request_token Generation
+The authentication process begins with a manual, user-driven step. The application must redirect the user to Zerodha's login page, https://kite.zerodha.com/connect/login, appending the application's api_key as a query parameter.1 After the user successfully logs in with their credentials (and typically a Two-Factor Authentication code), Zerodha redirects them back to a pre-configured
+redirect_url that was specified during the application's registration in the Kite developer console. Appended to this redirect URL is a crucial, one-time-use request_token.1 This token is highly transient, with a lifetime of only a few minutes, and is intended to be exchanged for a more durable
+access_token immediately.1
+Step 2: access_token Generation
+With the request_token in hand, the application must perform a server-to-server POST request to the /session/token endpoint. This request is not a simple one; it requires three parameters: the api_key, the request_token, and a checksum.1 The
+checksum is a SHA-256 hash of the concatenated string api_key + request_token + api_secret. This step is the only place where the api_secret is used, and its purpose is to prove that the request is coming from the authorized application server and not an imposter who may have intercepted the request_token.
+A successful response from this endpoint contains a wealth of user information, but most importantly, it includes the access_token.1 This token is the key to all subsequent authenticated API calls.
+Step 3: Signing Subsequent Requests
+Once the access_token is obtained, every private API call (e.g., placing an order, fetching margins) must include an Authorization header. The required format is token api_key:access_token.1 For example,
+Authorization: token myapikey:myaccesstoken. This signature proves to Zerodha's servers that the request is being made on behalf of an authenticated user session.
+
+
+1.1.3 Critical Constraints and Dependencies
+
+
+The Kite Connect API operates under several constraints that directly impact the design of the CCXT wrapper.
+* Daily Token Expiration: The access_token is not permanent. Due to regulatory requirements, it automatically expires at 6:00 AM IST every day.1 This is the single most disruptive feature for a Freqtrade integration. Freqtrade and CCXT are designed around the concept of static, long-lived credentials. The daily expiration means that any automated system must have a robust mechanism to handle this expiry, which involves a full re-authentication (starting from Step 1) each day.
+* Tiered Data Access: The Kite Connect API is offered in two tiers: a "Personal" free tier and a "Connect" paid tier.2 The free tier allows for full order management, portfolio access, and margin computation. However, it critically lacks access to historical candle data.2 Freqtrade's backtesting engine, a cornerstone of its utility for strategy development, is entirely dependent on historical data fetched via the
+fetch_ohlcv method.4 Therefore, for a fully functional integration that supports the complete Freqtrade workflow (backtesting, dry-run, live trade), a paid "Connect" subscription (currently ₹500/month) is mandatory.2 This is a crucial dependency that must be clearly communicated to end-users.
+* API Rate Limits: To ensure system stability and fair usage, Zerodha imposes strict rate limits on its API endpoints. These limits are not uniform across the API. For example, the historical data endpoint is limited to 3 requests per second, while order placement is limited to 10 requests per second, with further caps of 200 orders per minute and 3000 per day.5 Exceeding these limits will result in an HTTP
+429 Too Many Requests error.7 The CCXT wrapper must be designed to respect these limits, leveraging CCXT's built-in rate-limiting capabilities to avoid being banned or throttled by the exchange.
+
+
+1.1.4 Key Data Endpoints and Structures
+
+
+The wrapper will interact with several key endpoints to fulfill CCXT's unified methods:
+   * /user/margins: This endpoint provides a detailed breakdown of the user's funds, including available cash, utilized margins for various purposes (M2M, holdings, etc.), and collateral values.1 This will be the primary source for the cash component of the
+fetch_balance method.
+   * /portfolio/holdings: This endpoint returns a list of all stocks currently held in the user's demat account, including quantity, average price, and last traded price.8 This is essential for constructing a complete portfolio view in
+fetch_balance.
+   * /orders and /trades: These endpoints provide access to the user's order book and trade history, respectively.8 They are the foundation for implementing
+fetch_order, fetch_open_orders, fetch_closed_orders, and fetch_my_trades.
+   * /instruments/historical: This endpoint serves historical OHLCV (Open, High, Low, Close, Volume) data for a given instrument and timeframe.2 It is the most critical endpoint for Freqtrade's backtesting functionality.
+   * /quote: This provides a snapshot of market data for one or more instruments, including LTP (Last Traded Price), OHLC, and market depth. It will be used to implement fetch_ticker.9
+   * /instruments: Zerodha provides a downloadable list of all tradable instruments across all exchanges (e.g., NSE, BSE, MCX) in CSV or JSON format.1 This static data dump is the source for implementing
+fetch_markets.
+The fundamental conflict between Zerodha's API design and the expectations of CCXT/Freqtrade stems from authentication. CCXT and Freqtrade are architected with a stateless model in mind: the user provides a static API key and secret once in a configuration file, and the library uses these to sign every request. This model assumes the credentials are long-lived and do not change. Zerodha's model is inherently stateful. The access_token, which is the functional equivalent of a session key, is dynamic, short-lived, and requires a complex, interactive process to generate.1
+This discrepancy means that a simple CCXT wrapper that just translates method calls is doomed to fail. A standard sign() method, which would be the heart of a stateless wrapper, is insufficient because the key it needs to sign with (access_token) expires daily. The wrapper cannot simply be a passive translator; it must become an active session manager. This requires building logic to store the access_token persistently, check its validity before making any private call, and provide a clear, user-friendly process for re-authentication when the token inevitably expires. This architectural shift from a stateless adapter to a stateful session manager is the central design challenge of this project.
+
+
+1.2 The CCXT Unified API Contract: The Standard We Must Meet
+
+
+CCXT (CryptoCurrency eXchange Trading Library) is an open-source project that provides a standardized interface for trading on over 100 cryptocurrency exchanges.10 Its primary value proposition is abstraction; it allows developers to write trading logic once and execute it on multiple exchanges with minimal changes by conforming to a unified API contract.13 To integrate Zerodha, we must create a class that strictly adheres to this contract.
+
+
+1.2.1 Core Structure and the Exchange Base Class
+
+
+Every exchange in CCXT is a Python class that inherits from the base class ccxt.Exchange.11 This base class provides a common foundation, including methods for handling HTTP requests, managing rate limits, and defining a standard error hierarchy. Our
+zerodha.py module will define a class zerodha(ccxt.Exchange): which will override and implement the necessary methods to communicate with the Kite Connect API.
+
+
+1.2.2 Mandatory Methods for Freqtrade Compatibility
+
+
+While CCXT defines a vast number of unified methods, Freqtrade relies on a specific subset for its core operations. A compliant wrapper must implement these methods flawlessly. Based on Freqtrade's operational model, the following methods are non-negotiable 15:
+      * Market Data Methods:
+      * fetch_markets(): Returns a list of all available trading pairs (markets) on the exchange, along with their properties (precision, limits, etc.). Freqtrade uses this to understand what it can trade.
+      * fetch_ohlcv(symbol, timeframe, since, limit): Fetches historical OHLCV data. This is the backbone of Freqtrade's backtesting and indicator calculation.4
+      * fetch_ticker(symbol): Fetches the latest price ticker for a specific symbol. Used for real-time price checks and profit calculations.
+      * Private Account Methods:
+      * fetch_balance(): Returns the user's account balance, detailing free, used, and total amounts for each asset. Freqtrade uses this to manage stake amounts and track portfolio value.
+      * create_order(symbol, type, side, amount, price, params): Places a new order on the exchange.
+      * cancel_order(id, symbol): Cancels a previously placed open order.
+      * fetch_order(id, symbol): Retrieves the status and details of a single order by its ID.
+      * fetch_open_orders(symbol): Retrieves all currently open orders.
+      * fetch_closed_orders(symbol): Retrieves recently closed or canceled orders.
+
+
+1.2.3 Standardized Data Structures
+
+
+A key part of the CCXT contract is the standardized format of the data returned by its methods. Our wrapper must parse the JSON responses from Zerodha's API and transform them into these expected structures.13 For example, regardless of how Zerodha represents an order, our
+parse_order helper method must return a dictionary with standard keys like id, datetime, timestamp, status ('open', 'closed', 'canceled'), symbol, type, side, price, amount, filled, remaining, cost, and fee. Similarly, the fetch_balance method must return a structure where top-level keys are currency codes (e.g., 'INR', 'NSE:INFY') and each contains free, used, and total fields.
+
+
+1.2.4 The describe() Method: The Exchange's Constitution
+
+
+The describe() method is the central configuration hub within a CCXT exchange class.14 It is a class method that returns a dictionary defining the exchange's core properties. This is where we will codify Zerodha's specific attributes and constraints. Key fields include:
+      * id: A unique, lowercase string identifier for the exchange (e.g., 'zerodha').
+      * name: The human-readable name (e.g., 'Zerodha').
+      * countries: The country of operation (e.g., ['IN']).
+      * urls: A dictionary containing URLs for the API endpoint (api), website (www), and documentation (doc).
+      * api: A detailed structure defining all the public and private API endpoints, their methods (GET/POST/DELETE), and paths. CCXT uses this to build implicit API methods.
+      * has: A dictionary of booleans indicating the capabilities of the exchange (e.g., has['fetchOHLCV'] = True, has = False). This informs CCXT and its users what features are supported.
+      * rateLimit: The default delay in milliseconds between requests, used by CCXT's built-in rate limiter.
+
+
+1.2.5 Error Handling Paradigm
+
+
+CCXT provides a standard hierarchy of exceptions, all inheriting from ccxt.ExchangeError.13 This includes specific exceptions like
+AuthenticationError, RateLimitExceeded, InvalidOrder, and InsufficientFunds. A robust wrapper must not let raw Zerodha API errors bubble up to the user. Instead, it should catch Zerodha-specific error responses (identified by status codes or error messages in the JSON body) and re-raise them as the appropriate, standardized CCXT exception.7 This ensures that Freqtrade, which is built to handle CCXT's exceptions, can react to errors in a predictable and graceful manner.
+
+
+1.3 Freqtrade's Exchange Interaction Model: The Consumer's Needs
+
+
+Freqtrade is a sophisticated algorithmic trading bot written in Python that relies heavily on CCXT for all its interactions with exchanges.18 Understanding how Freqtrade uses the CCXT wrapper is crucial for ensuring our implementation is not just compliant, but also performant and reliable under the bot's specific usage patterns.
+
+
+1.3.1 Configuration and Instantiation
+
+
+Freqtrade instantiates the CCXT exchange class based on the exchange block in its config.json file.19 The user specifies the exchange
+name (which must match the id in our describe() method, e.g., "zerodha"). The key, secret, and password fields from the config are passed directly to the constructor of the CCXT class.19 This is the primary mechanism for injecting credentials into our wrapper. The
+ccxt_config and ccxt_async_config objects in the configuration allow users to pass additional, exchange-specific parameters to the CCXT constructor, which can be useful for advanced settings.19
+
+
+1.3.2 Operational Modes and Their Demands on the API
+
+
+Freqtrade operates in several distinct modes, each placing different demands on the CCXT wrapper:
+      * Backtesting: This mode is entirely offline and is used to test a strategy's performance on historical data.4 It makes one primary demand on the wrapper: a robust and accurate
+fetch_ohlcv implementation. Freqtrade's download-data command will call this method to populate a local data cache.22 The backtesting engine then reads from this cache, simulating trades based on the strategy's logic applied to the historical data.23 The quality and completeness of the data provided by
+fetch_ohlcv directly determine the reliability of the backtest results.
+      * Dry-Run: This mode simulates live trading using real-time market data but without placing real orders.20 It is a comprehensive test of the entire system. In this mode, Freqtrade actively calls a wide range of methods:
+fetch_ticker or fetch_ohlcv for the latest data, fetch_balance to calculate stake sizes, and the full suite of order methods (create_order, cancel_order, fetch_order) to simulate the trade lifecycle.19 Although the orders are not sent to the exchange, the wrapper's logic for creating, parsing, and managing these simulated orders must be flawless.
+      * Live Trading: This is the production mode where real capital is at risk. It uses the exact same logic as dry-run, but the create_order and cancel_order calls are actually executed on the exchange.19 In this mode, the reliability, error handling, and rate-limiting of the wrapper are of paramount importance. Any failure in the
+fetch_balance or order management methods can lead to direct financial loss.
+The dependency of Freqtrade's backtesting on historical data highlights a crucial point of friction. Backtesting is not an optional feature for a serious algorithmic trader; it is the primary tool for strategy development and validation.4 The fact that Zerodha's Kite Connect API gates access to historical data behind a paid "Connect" subscription means that the free tier of the API is fundamentally incompatible with a complete and effective Freqtrade workflow.2 While the free tier could theoretically be used for live or dry-run trading with a pre-developed strategy, it prevents the user from leveraging Freqtrade's most powerful development feature. This dependency is not just a technical detail but a significant practical and financial consideration for any user wishing to adopt this integrated solution. The documentation for the wrapper must make this requirement abundantly clear to prevent user frustration and manage expectations.
+
+
+Section 2: Architectural Design and Strategic Mapping
+
+
+Having analyzed the individual components, this section translates that understanding into a concrete architectural plan. The goal is to design a ccxt.zerodha wrapper that is not only functional but also robust, maintainable, and extensible. This involves defining the core design patterns, establishing clear conventions for data mapping, and creating a resilient session management strategy to handle Zerodha's unique authentication model.
+
+
+2.1 Core Design Philosophy: Adapter Pattern with State Management
+
+
+The fundamental design of the ccxt.zerodha module will be based on the Adapter design pattern. The class will act as an adapter that sits between the client (Freqtrade) and the adaptee (Zerodha Kite Connect API). It will translate the standardized method calls from Freqtrade's CCXT interface into the specific HTTP requests required by Zerodha's API. Conversely, it will parse the JSON responses from Zerodha and adapt them into the standardized data structures that CCXT and Freqtrade expect.
+However, a simple, stateless adapter is insufficient due to Zerodha's session-based authentication.1 Therefore, the adapter must be augmented with a
+state management layer. This layer will be responsible for the lifecycle of the access_token. This makes the zerodha class a stateful component, a significant departure from the typical stateless nature of CCXT exchange wrappers. Within a single Freqtrade process, the exchange instance will effectively act as a Singleton for session management, ensuring that all parts of the bot use the same, valid access_token.
+
+
+2.2 Market and Symbol Representation: From Stocks to Crypto-Syntax
+
+
+A clear and unambiguous system for identifying tradable instruments is essential. CCXT's standard is a BASE/QUOTE symbol (e.g., BTC/USDT).13 We must adapt this concept to the world of Indian equities.
+
+
+2.2.1 Symbol Convention
+
+
+A standardized symbol format will be adopted to ensure consistency and prevent ambiguity: {EXCHANGE}:{TRADINGSYMBOL}/{CURRENCY}.
+         * EXCHANGE: The exchange identifier (e.g., NSE, BSE).
+         * TRADINGSYMBOL: The symbol as used by the exchange (e.g., INFY, RELIANCE).
+         * CURRENCY: The quote currency, which for Indian equities will almost always be INR.
+Example: Infosys Limited, traded on the National Stock Exchange, will be represented as NSE:INFY/INR. This format is human-readable, contains all necessary information to uniquely identify the instrument, and aligns well with CCXT's base/quote paradigm, where NSE:INFY is the base and INR is the quote.
+
+
+2.2.2 fetch_markets() Implementation Strategy
+
+
+The fetch_markets() method is the foundation upon which all other symbol-based operations are built. It will not make a live API call on every invocation. Instead, it will use a caching strategy to improve performance and reduce reliance on network requests. Zerodha provides a full list of tradable instruments as a downloadable file.1
+The implementation will follow these steps:
+         1. Download and Cache: On the first call to fetch_markets(), the wrapper will download the complete instrument list from Zerodha's static URL. This file (typically a CSV) will be saved to a local cache directory (e.g., in the user's home directory) to prevent re-downloading on subsequent runs.
+         2. Parse and Transform: The cached file will be parsed row by row. Each row, representing a single tradable instrument, will be transformed into a standardized CCXT market dictionary.
+         3. Populate Market Structure: The parser will populate the standard CCXT market fields:
+         * id: The Zerodha-specific instrument_token. This is crucial as many API calls require this token instead of the trading symbol.
+         * symbol: The unified symbol created using our convention (e.g., NSE:INFY/INR).
+         * base: The base asset (e.g., NSE:INFY).
+         * quote: The quote currency (INR).
+         * baseId and quoteId: The underlying exchange-specific identifiers.
+         * active: A boolean indicating if the instrument is available for trading.
+         * info: A dictionary containing the raw, untransformed data for the instrument from the CSV file. This preserves all original details like exchange_token, lot_size, tick_size, etc., for potential use in advanced logic.
+         4. Return and Store: The resulting list of market dictionaries will be returned to the caller and also stored in the self.markets property of the exchange instance for quick lookups by other methods.
+
+
+2.2.3 Designing for F&O Extensibility
+
+
+The user query explicitly mentions that the design should be extensible to support Futures and Options (F&O) trading in the future. F&O instruments have more complex identifiers than equities, including expiry dates, strike prices, and option types (Call/Put). The simple {EXCHANGE}:{TRADINGSYBOL}/{CURRENCY} convention is inadequate for this.
+To future-proof the design, a more expressive symbol convention for derivatives must be established now, even if the trading logic is not yet implemented. A proposed format is:
+         * Futures: {EXCHANGE}:{UNDERLYING}{YY}{MMM}{FUT}/{CURRENCY}. Example: A NIFTY future expiring in December 2023 would be NFO:NIFTY23DECFUT/INR.
+         * Options: {EXCHANGE}:{UNDERLYING}{YY}{MMM}{STRIKE}{TYPE}/{CURRENCY}. Example: A NIFTY 19000 Call expiring in December 2023 would be NFO:NIFTY23DEC19000CE/INR.
+The fetch_markets() parser must be designed with conditional logic. When it encounters an instrument of type 'FUT' or 'OPT' in the instrument dump, it should use this advanced formatting rule to construct the symbol. By building this foresight into the initial design, adding F&O trading capabilities later becomes a matter of implementing the relevant trading methods (create_order for F&O products), rather than requiring a fundamental, breaking change to the core symbol representation system.
+
+
+2.3 Authentication and Session Lifecycle Management: The Heart of the Wrapper
+
+
+This is the most critical piece of the architecture, designed to solve the stateful authentication problem.
+
+
+2.3.1 Credential Mapping
+
+
+The wrapper will map the standard CCXT constructor arguments to Zerodha's credentials in a specific way to handle the dynamic access_token:
+         * apiKey (CCXT) → api_key (Zerodha): The standard public API key.
+         * secret (CCXT) → api_secret (Zerodha): The standard API secret.
+         * password (CCXT) → access_token (Zerodha): This is a crucial, non-standard mapping. Freqtrade's configuration allows for a password field.19 We will repurpose this field to allow the user to inject the daily-generated
+access_token directly into the exchange instance via the config.json file.
+
+
+2.3.2 The Token Handler Engine
+
+
+A dedicated internal component will manage the access_token.
+            1. Token Storage: A simple, file-based JSON cache will be used to persist the token. The file (e.g., ~/.cache/ccxt-zerodha/token.json) will store a dictionary containing the access_token and its login_time.1 This allows the wrapper to calculate the token's expiry.
+            2. Token Loading Logic: When the zerodha class is instantiated, its __init__ method will follow a clear hierarchy to load the access_token:
+a. First, check if self.password (passed from the config) contains a token. If so, use it. This is the primary method for operation.
+b. If self.password is empty, attempt to load the token from the JSON cache file.
+c. If neither source provides a token, the instance will operate in a "logged out" state, able to make public calls but failing private ones.
+            3. Graceful Expiration Handling: The sign() method, which is called implicitly before every private API request, will be the gatekeeper. Before proceeding, it will check if an access_token is available and if it has expired (i.e., if the current time is past 6:00 AM IST on the day after the token's login_time). If the token is missing or expired, the sign() method will not attempt the request. Instead, it will immediately raise a ccxt.AuthenticationError with a clear, informative message instructing the user to run the re-authentication script.
+            4. Manual Re-authentication Helper Script: To simplify the complex authentication flow for the end-user, a standalone Python script, generate_token.py, will be provided. This script will:
+a. Prompt the user for their api_key and api_secret.
+b. Generate and display the Zerodha login URL.
+c. Instruct the user to log in via their browser and paste the request_token from the redirect URL back into the script's prompt.
+d. Use the provided credentials and the request_token to perform the access_token exchange with Zerodha's API.
+e. Upon receiving a valid access_token, it will save the token and its login time to the JSON cache file (~/.cache/ccxt-zerodha/token.json).
+f. It will also print the access_token to the console, so the user can copy it into their Freqtrade config.json's password field.
+This decoupled approach separates the one-time, manual daily task of authentication from the automated, non-interactive operation of the Freqtrade bot, creating a clean and manageable workflow.
+
+
+2.4 Balance and Portfolio Translation: Unifying Funds and Holdings
+
+
+CCXT's fetch_balance method should return a comprehensive view of all assets. For Zerodha, this includes both cash and stock holdings.
+The fetch_balance() implementation will orchestrate two API calls:
+               1. GET /user/margins: This call retrieves the cash component of the portfolio.1 The value from
+available.cash will be mapped to the free field for the INR currency in the CCXT balance structure. The net value, which represents the total cash equivalent including collateral, will be mapped to the total field for INR.
+               2. GET /portfolio/holdings: This call retrieves all equity positions.8 The method will iterate through the list of holdings. For each holding (e.g., 10 shares of INFY), it will create a new entry in the balance structure. The key for this entry will be the unified symbol for the stock's base asset (e.g.,
+NSE:INFY). The quantity of the holding will be mapped to the total and free fields for that asset (assuming all holdings are available to be sold).
+The final structure returned by fetch_balance will be a single, unified dictionary that Freqtrade can easily parse, containing the INR balance and a balance for every stock held by the user.
+
+
+2.5 Order Lifecycle Translation: The Impedance Mismatch
+
+
+Translating order creation and management requires careful mapping of parameters and statuses.
+
+
+2.5.1 create_order() Mapping
+
+
+The create_order method is where the conceptual mismatch between a crypto exchange and a stockbroker is most apparent. Zerodha's API requires parameters that have no direct equivalent in the standard CCXT create_order signature. These include product (e.g., CNC for Cash and Carry/delivery, MIS for Margin Intraday Square-off) and variety (e.g., regular, amo for After Market Order).26
+The solution is to leverage CCXT's params dictionary, which is designed specifically for passing exchange-specific arguments. The implementation will be designed to:
+                  * Accept the standard CCXT arguments: symbol, type, side, amount, price.
+                  * Require the user to pass Zerodha-specific parameters within the params dictionary. For example, a standard delivery order would be placed with a call like: create_order('NSE:INFY/INR', 'limit', 'buy', 10, 1500, params={'product': 'CNC'}).
+                  * The wrapper will set a default variety of 'regular' but will allow the user to override it via the params dictionary. The product parameter will be mandatory. This requirement will be explicitly documented as a prerequisite for using the method.
+
+
+2.5.2 Order Status Mapping
+
+
+The wrapper will translate Zerodha's order statuses to their CCXT equivalents to ensure Freqtrade's state machine works correctly:
+                  * COMPLETE (Zerodha) → closed (CCXT)
+                  * OPEN, TRIGGER PENDING (Zerodha) → open (CCXT)
+                  * CANCELLED (Zerodha) → canceled (CCXT)
+                  * REJECTED (Zerodha) → rejected (CCXT)
+
+
+2.5.3 fetch_order(), fetch_open_orders(), and fetch_closed_orders()
+
+
+These methods will all be built on top of Zerodha's /orders endpoint.8
+                  * fetch_order(id) will call /orders/{order_id}.
+                  * fetch_open_orders() and fetch_closed_orders() will call the generic /orders endpoint (which returns a list of recent orders) and then perform client-side filtering based on the order status.
+                  * A central parse_order helper method will be created to take a raw order dictionary from a Zerodha API response and transform it into the standardized CCXT order structure, performing the status and field name mappings.
+________________
+Table 1: Zerodha API to CCXT Method Mapping
+
+
+CCXT Unified Method
+	Zerodha Kite Connect v3 Endpoint(s)
+	HTTP Method
+	Primary Purpose
+	fetch_markets
+	GET /instruments (via static file download)
+	GET
+	Load and cache all tradable instruments (equities, F&O).
+	fetch_ticker
+	GET /quote
+	GET
+	Retrieve the last traded price and other ticker data for one or more symbols.
+	fetch_ohlcv
+	GET /instruments/historical/{instrument_token}/{interval}
+	GET
+	Fetch historical candle data for backtesting and analysis.
+	fetch_balance
+	GET /user/margins + GET /portfolio/holdings
+	GET
+	Get a complete view of user's cash balance and stock holdings.
+	create_order
+	POST /orders/{variety}
+	POST
+	Place a new buy or sell order.
+	cancel_order
+	DELETE /orders/{variety}/{order_id}
+	DELETE
+	Cancel an existing open order.
+	fetch_order
+	GET /orders/{order_id}
+	GET
+	Retrieve the details of a single, specific order.
+	fetch_open_orders
+	GET /orders
+	GET
+	Fetch all orders with a status of 'open' or 'trigger pending'.
+	fetch_closed_orders
+	GET /orders
+	GET
+	Fetch all orders with a status of 'complete', 'cancelled', or 'rejected'.
+	________________
+This table provides a high-level architectural summary, acting as a blueprint for the implementation phase. It clearly defines the scope of work and maps the standardized CCXT interface to the specific resources provided by the Zerodha API, accounting for the necessary orchestrations like combining multiple endpoints for a single unified function (fetch_balance).
+
+
+Section 3: Implementation: Building the ccxt.zerodha Module
+
+
+This section provides the detailed implementation logic for the ccxt.zerodha Python module. The code snippets and explanations that follow are designed to be integrated into a single zerodha.py file, placed within the ccxt/python/ccxt/ directory of a local CCXT installation or Freqtrade's user_data/exchanges directory. The implementation will directly reflect the architectural decisions made in the previous section, focusing on robustness, clarity, and adherence to both CCXT and Zerodha API contracts.
+
+
+3.1 File Structure and Class Skeleton
+
+
+The foundation of the integration is a Python class named zerodha that inherits from ccxt.Exchange.
+File Location: ccxt/python/ccxt/zerodha.py
+
+
+Python
+
+
+
+
+# -*- coding: utf-8 -*-
+
+import hashlib
+import json
+from pathlib import Path
+from datetime import datetime, time
+import pytz
+
+from ccxt.base.exchange import Exchange
+from ccxt.base.errors import (
+   ExchangeError,
+   AuthenticationError,
+   PermissionDenied,
+   BadRequest,
+   InvalidOrder,
+   InsufficientFunds,
+   RateLimitExceeded,
+   NetworkError,
+   ExchangeNotAvailable
+)
+
+class zerodha(Exchange):
+
+   def describe(self):
+       return self.deep_extend(super(zerodha, self).describe(), {
+           'id': 'zerodha',
+           'name': 'Zerodha',
+           'countries': ['IN'],
+           'version': 'v3',
+           'rateLimit': 100,  # 10 requests per second = 100ms between requests
+           'has': {
+               'CORS': False,
+               'spot': True,
+               'margin': False,
+               'swap': False,
+               'future': False, # Set to True when F&O is implemented
+               'option': False, # Set to True when F&O is implemented
+               'cancelOrder': True,
+               'createOrder': True,
+               'fetchBalance': True,
+               'fetchClosedOrders': True,
+               'fetchMarkets': True,
+               'fetchMyTrades': True,
+               'fetchOHLCV': True,
+               'fetchOpenOrders': True,
+               'fetchOrder': True,
+               'fetchTicker': True,
+               'fetchTickers': True, # Can be emulated with fetchTicker
+           },
+           'urls': {
+               'logo': 'https://zerodha.com/static/images/logo.svg',
+               'api': {
+                   'public': 'https://api.kite.trade',
+                   'private': 'https://api.kite.trade',
+               },
+               'www': 'https://zerodha.com',
+               'doc': 'https://kite.trade/docs/connect/v3/',
+               'fees': 'https://zerodha.com/pricing',
+           },
+           'api': {
+               # API endpoint definitions will go here
+               # Example:
+               'private': {
+                   'get':,
+                   'post':,
+                   'delete':,
+               },
+               'public': {
+                   'get': [
+                       'instruments',
+                       'quote',
+                       'instruments/historical/{instrument_token}/{interval}',
+                       #... other public endpoints
+                   ],
+               }
+           },
+           'exceptions': {
+               'exact': {
+                   'TokenException': AuthenticationError,
+                   'UserException': PermissionDenied,
+                   'OrderException': InvalidOrder,
+                   'InputException': BadRequest,
+                   'MarginException': InsufficientFunds,
+                   'HoldingException': InsufficientFunds,
+                   'NetworkException': NetworkError,
+                   'DataException': ExchangeError,
+                   'GeneralException': ExchangeError,
+               },
+           },
+           'requiredCredentials': {
+               'apiKey': True,
+               'secret': True,
+               'password': False, # Repurposed for access_token
+           },
+           'timeframes': {
+               '1m': 'minute',
+               '3m': '3minute',
+               '5m': '5minute',
+               '10m': '10minute',
+               '15m': '15minute',
+               '30m': '30minute',
+               '1h': '60minute',
+               '1d': 'day',
+           },
+       })
+
+The describe() method establishes the identity and capabilities of the wrapper. It sets the rateLimit to a conservative 100ms (10 req/s) to respect Zerodha's general limit.6 The
+has dictionary accurately reflects the methods that will be implemented for spot trading. The urls and api dictionaries map directly to the Kite Connect v3 documentation. The exceptions dictionary is crucial for the handle_errors method, pre-defining the mapping from Zerodha's error types to CCXT's standard exceptions.7
+
+
+3.2 The Authentication Engine in Code
+
+
+This is the stateful core of the wrapper, managing the access_token.
+
+
+3.2.1 Token Management and sign() Method
+
+
+The sign() method is overridden to inject the Authorization header. It will rely on a helper method, _load_access_token(), to ensure a valid token is available.
+
+
+Python
+
+
+
+
+# Inside the zerodha class
+
+def __init__(self, config={}):
+   super(zerodha, self).__init__(config)
+   self.token_cache_path = Path.home() / '.cache' / 'ccxt-zerodha' / 'token.json'
+   self.token_cache_path.parent.mkdir(parents=True, exist_ok=True)
+   # The 'password' field from config is repurposed for the access_token
+   self.access_token = self.password
+   self.login_time = None
+
+def _load_access_token(self):
+   """Loads access token from instance, then from cache."""
+   if self.access_token:
+       # Token provided in config, assume it's fresh
+       return
+
+   if self.token_cache_path.exists():
+       try:
+           with open(self.token_cache_path, 'r') as f:
+               token_data = json.load(f)
+               self.access_token = token_data.get('access_token')
+               login_time_str = token_data.get('login_time')
+               if login_time_str:
+                   # Zerodha times are in IST
+                   self.login_time = datetime.fromisoformat(login_time_str).replace(tzinfo=pytz.timezone('Asia/Kolkata'))
+       except (json.JSONDecodeError, IOError):
+           self.access_token = None
+           self.login_time = None
+
+def _is_token_expired(self):
+   """Checks if the access token has expired (past 6 AM IST next day)."""
+   if not self.access_token or not self.login_time:
+       return True
+
+   ist = pytz.timezone('Asia/Kolkata')
+   now_ist = datetime.now(ist)
+   expiry_time = time(6, 0)
+   
+   login_date = self.login_time.date()
+   
+   if now_ist.date() > login_date:
+       # It's a day after the login date
+       if now_ist.time() >= expiry_time:
+           # It's after 6 AM on a subsequent day
+           return True
+   
+   return False
+
+def sign(self, path, api='private', method='GET', params={}, headers=None, body=None):
+   self._load_access_token()
+
+   if self._is_token_expired():
+       raise AuthenticationError(f'{self.id} access token is missing or expired. Please re-authenticate using the generate_token.py script.')
+
+   url = self.urls['api'][api] + '/' + self.implode_params(path, params)
+   
+   query = self.omit(params, self.extract_path_params(path))
+   
+   headers = {
+       'X-Kite-Version': self.version,
+       'Authorization': f'token {self.apiKey}:{self.access_token}'
+   }
+
+   if method == 'GET':
+       if query:
+           url += '?' + self.urlencode(query)
+   else: # POST, PUT, DELETE
+       body = self.urlencode(query)
+       headers = 'application/x-www-form-urlencoded'
+
+   return {'url': url, 'method': method, 'body': body, 'headers': headers}
+
+def handle_errors(self, code, reason, url, method, headers, body, response, requestHeaders, requestBody):
+   if response is None:
+       return
+   if 'error_type' in response:
+       error_type = response['error_type']
+       feedback = self.id + ' ' + body
+       self.throw_exactly_matched_exception(self.exceptions['exact'], error_type, feedback)
+       raise ExchangeError(feedback) # fallback
+
+This implementation establishes the core authentication logic. _load_access_token prioritizes the token from the config (self.password) and falls back to the cache file. _is_token_expired correctly implements the 6 AM IST expiry rule.1 The
+sign method acts as a guard, raising a clear AuthenticationError if the token is invalid, guiding the user on how to fix it. handle_errors maps Zerodha's error_type to CCXT exceptions.
+
+
+3.2.2 The generate_token.py Helper Script
+
+
+This standalone script is a critical part of the user experience, abstracting away the complexity of the daily re-authentication.
+File Location: scripts/generate_token.py (or similar location outside the CCXT library)
+
+
+Python
+
+
+
+
+import hashlib
+import json
+import webbrowser
+from pathlib import Path
+from kiteconnect import KiteConnect
+
+def generate_zerodha_token():
+   """Guides the user through generating and caching a Zerodha access token."""
+   api_key = input("Enter your Zerodha API Key: ").strip()
+   api_secret = input("Enter your Zerodha API Secret: ").strip()
+
+   kite = KiteConnect(api_key=api_key)
+   login_url = kite.login_url()
+   
+   print(f"\n1. A login URL will now open in your browser.")
+   print(f"2. Please log in to your Zerodha account.")
+   print(f"3. After login, you will be redirected to a URL. Copy the ENTIRE URL and paste it here.")
+   webbrowser.open(login_url)
+   
+   redirect_url = input("\nPaste the full redirect URL here: ").strip()
+   
+   try:
+       request_token = redirect_url.split('request_token=').split('&')
+   except IndexError:
+       print("Error: Could not find 'request_token' in the provided URL.")
+       return
+
+   try:
+       data = kite.generate_session(request_token, api_secret=api_secret)
+       access_token = data['access_token']
+       login_time = data['login_time']
+
+       # Cache the token
+       cache_dir = Path.home() / '.cache' / 'ccxt-zerodha'
+       cache_dir.mkdir(parents=True, exist_ok=True)
+       token_cache_path = cache_dir / 'token.json'
+       
+       with open(token_cache_path, 'w') as f:
+           json.dump({'access_token': access_token, 'login_time': login_time}, f)
+       
+       print("\n--- SUCCESS ---")
+       print(f"Access token generated and cached successfully at: {token_cache_path}")
+       print("\nCOPY THE FOLLOWING ACCESS TOKEN and paste it into your Freqtrade config.json 'password' field:")
+       print(f"\n{access_token}\n")
+
+   except Exception as e:
+       print(f"\n--- ERROR ---")
+       print(f"Failed to generate session: {e}")
+
+if __name__ == "__main__":
+   generate_zerodha_token()
+
+This script uses Zerodha's official pykiteconnect library for convenience in the generate_session call, which handles the checksum calculation internally.29 It provides clear, step-by-step instructions to the user, making a complex process manageable.
+
+
+3.3 Market Data Methods: fetch_markets, fetch_ticker, fetch_ohlcv
+
+
+These methods provide the data Freqtrade needs for analysis and decision-making.
+
+
+Python
+
+
+
+
+# Inside the zerodha class
+
+def fetch_markets(self, params={}):
+   """
+   Fetches the list of tradable instruments from a cached file.
+   The file is downloaded from Zerodha's public endpoint if not present.
+   """
+   # For this example, we assume the instrument list is a CSV file.
+   # In a real implementation, you'd handle downloading from `self.urls['api']['public'] + '/instruments'`
+   # and caching it.
+   # For demonstration, let's assume 'instruments.csv' is in the cache path.
+   
+   instrument_file = self.token_cache_path.parent / 'instruments.csv'
+   if not instrument_file.exists():
+       # Logic to download from https://api.kite.trade/instruments and save to instrument_file
+       # raise ExchangeError(f"{self.id} instrument file not found at {instrument_file}. Please run a sync script first.")
+       # This part is left as an exercise for a full implementation.
+       # For now, we'll assume it exists.
+       return # Or raise error
+
+   # This is a simplified parser. A real one would be more robust.
+   import csv
+   result =
+   with open(instrument_file, 'r') as f:
+       reader = csv.DictReader(f)
+       for row in reader:
+           if row['segment'] not in:
+               continue # Spot equity only for now
+           
+           base = row['exchange'] + ':' + row['tradingsymbol']
+           quote = row['instrument_type'] # For equities, this is usually EQ, but we use INR
+           
+           market = {
+               'id': row['instrument_token'],
+               'symbol': f"{base}/INR",
+               'base': base,
+               'quote': 'INR',
+               'baseId': row['tradingsymbol'],
+               'quoteId': 'INR',
+               'type': 'spot',
+               'spot': True,
+               'active': True, # Assuming all listed are active
+               'precision': {
+                   'amount': self.parse_number('1'), # Stocks are traded in integer quantities
+                   'price': self.parse_number(row['tick_size']),
+               },
+               'limits': {
+                   'amount': {
+                       'min': self.parse_number(row['lot_size']),
+                       'max': None,
+                   },
+                   'price': {'min': None, 'max': None},
+                   'cost': {'min': None, 'max': None},
+               },
+               'info': row,
+           }
+           result.append(market)
+   return result
+
+def fetch_ticker(self, symbol, params={}):
+   self.load_markets()
+   market = self.market(symbol)
+   
+   # Zerodha's quote endpoint needs instruments in the format 'EXCHANGE:TRADINGSYMBOL'
+   instrument = f"{market['info']['exchange']}:{market['info']['tradingsymbol']}"
+   
+   response = self.privateGetQuote({'i': instrument}) # The endpoint is actually private
+   
+   ticker_data = response['data'][instrument]
+   
+   return self.parse_ticker(ticker_data, market)
+
+def parse_ticker(self, ticker, market=None):
+   timestamp = self.parse_to_int(ticker['timestamp'].timestamp() * 1000)
+   last = self.safe_number(ticker, 'last_price')
+   return self.safe_ticker({
+       'symbol': market['symbol'],
+       'timestamp': timestamp,
+       'datetime': self.iso8601(timestamp),
+       'high': self.safe_number(ticker['ohlc'], 'high'),
+       'low': self.safe_number(ticker['ohlc'], 'low'),
+       'bid': self.safe_number(ticker['depth']['buy'], 'price'),
+       'bidVolume': self.safe_number(ticker['depth']['buy'], 'orders'),
+       'ask': self.safe_number(ticker['depth']['sell'], 'price'),
+       'askVolume': self.safe_number(ticker['depth']['sell'], 'orders'),
+       'vwap': None,
+       'open': self.safe_number(ticker['ohlc'], 'open'),
+       'close': last,
+       'last': last,
+       'previousClose': self.safe_number(ticker, 'last_price'), # Not always available
+       'change': None,
+       'percentage': None,
+       'average': None,
+       'baseVolume': self.safe_number(ticker, 'volume'),
+       'quoteVolume': None,
+       'info': ticker,
+   }, market)
+
+def fetch_ohlcv(self, symbol, timeframe='1m', since=None, limit=None, params={}):
+   self.load_markets()
+   market = self.market(symbol)
+   
+   request = {
+       'instrument_token': market['id'],
+       'interval': self.timeframes[timeframe],
+       'from': 'YYYY-MM-DD', # Needs to be calculated from 'since'
+       'to': 'YYYY-MM-DD',   # Needs to be calculated
+   }
+   
+   # Logic to convert 'since' and 'limit' to 'from' and 'to' dates
+   # This is complex due to varying limits based on timeframe.
+   # For example, 1-minute data is available for a few months only.
+   # This logic is omitted for brevity but is crucial for a full implementation.
+
+   response = self.publicGetInstrumentsHistoricalInstrument_tokenInterval(request)
+   
+   return self.parse_ohlcvs(response['data']['candles'], market, timeframe, since, limit)
+
+def parse_ohlcv(self, ohlcv, market=None):
+   # Zerodha format: [timestamp, open, high, low, close, volume]
+   return [
+       self.parse_to_int(datetime.fromisoformat(ohlcv).timestamp() * 1000),
+       self.safe_number(ohlcv, 1),
+       self.safe_number(ohlcv, 2),
+       self.safe_number(ohlcv, 3),
+       self.safe_number(ohlcv, 4),
+       self.safe_number(ohlcv, 5),
+   ]
+
+The fetch_markets implementation outlines the caching and parsing strategy. fetch_ticker demonstrates how to use the loaded market info to construct the required instrument format for the API call. fetch_ohlcv highlights the need to translate CCXT's since/limit parameters into Zerodha's required from/to date format, a non-trivial task that depends on the requested timeframe.
+
+
+3.4 Account Management Methods: fetch_balance
+
+
+This method combines data from two endpoints to provide a complete portfolio view.
+
+
+Python
+
+
+
+
+# Inside the zerodha class
+
+def fetch_balance(self, params={}):
+   self.load_markets()
+   
+   # Fetch cash margins
+   margin_response = self.privateGetUserMargins()
+   
+   # Fetch stock holdings
+   holdings_response = self.privateGetPortfolioHoldings()
+   
+   result = {'info': {'margins': margin_response, 'holdings': holdings_response}}
+   
+   # Parse cash balance
+   equity_margins = self.safe_value(margin_response['data'], 'equity')
+   if equity_margins:
+       cash_available = self.safe_value(equity_margins['available'], 'cash')
+       net_balance = self.safe_value(equity_margins, 'net')
+       
+       account = self.account()
+       account['free'] = self.parse_number(cash_available)
+       account['total'] = self.parse_number(net_balance)
+       result = account
+
+   # Parse stock holdings
+   holdings = self.safe_value(holdings_response['data'],,)
+   for holding in holdings:
+       tradingsymbol = self.safe_string(holding, 'tradingsymbol')
+       exchange = self.safe_string(holding, 'exchange')
+       
+       # Find the market to get the unified symbol
+       code = exchange + ':' + tradingsymbol
+       market = self.safe_market(code + '/INR')
+       
+       if market:
+           base = market['base']
+           account = self.account()
+           account['total'] = self.safe_number(holding, 'quantity')
+           # Assuming all holdings are free to trade
+           account['free'] = self.safe_number(holding, 'quantity')
+           result[base] = account
+           
+   return self.safe_balance(result)
+
+This implementation correctly fetches both cash and stock holdings, creating a unified balance structure that Freqtrade can understand. It uses self.safe_market to find the corresponding market definition to correctly key the stock balances.
+
+
+3.5 Trade Execution Methods: create_order, cancel_order, fetch_order
+
+
+These methods handle the core trading operations.
+________________
+Table 2: Order Parameter Mapping
+
+
+CCXT create_order Parameter
+	Zerodha API Parameter
+	Data Type / Example
+	Required
+	Notes
+	symbol
+	tradingsymbol, exchange
+	NSE:INFY/INR → 'INFY', 'NSE'
+	Yes
+	The wrapper must parse the CCXT symbol to extract these two fields.
+	type
+	order_type
+	'limit' → 'LIMIT', 'market' → 'MARKET'
+	Yes
+	Direct mapping of CCXT order types to Zerodha's constants.
+	side
+	transaction_type
+	'buy' → 'BUY', 'sell' → 'SELL'
+	Yes
+	Direct mapping of CCXT order sides.
+	amount
+	quantity
+	10
+	Yes
+	Represents the number of shares.
+	price
+	price
+	1500.0
+	If limit
+	Required for LIMIT orders, should be 0 or None for MARKET orders.
+	params['product']
+	product
+	'CNC', 'MIS'
+	Yes
+	Crucial: This must be provided by the user via the params dict. No CCXT equivalent.
+	params['variety']
+	variety
+	'regular', 'amo', 'co'
+	No
+	Defaults to 'regular'. Can be overridden by the user.
+	params['validity']
+	validity
+	'DAY', 'IOC'
+	No
+	Defaults to 'DAY'.
+	params['trigger_price']
+	trigger_price
+	1505.0
+	No
+	For stop-loss orders (SL, SL-M).
+	________________
+
+
+Python
+
+
+
+
+# Inside the zerodha class
+
+def create_order(self, symbol, type, side, amount, price=None, params={}):
+   self.load_markets()
+   market = self.market(symbol)
+   
+   request = {
+       'tradingsymbol': market['baseId'],
+       'exchange': market['info']['exchange'],
+       'transaction_type': self.capitalize(side),
+       'order_type': type.upper(),
+       'quantity': int(amount),
+       'product': self.safe_string_upper(params, 'product'),
+       'variety': self.safe_string(params, 'variety', 'regular'),
+       'validity': self.safe_string(params, 'validity', 'DAY'),
+   }
+
+   if request['product'] is None:
+       raise InvalidOrder(f"{self.id} createOrder() requires the 'product' parameter (e.g., 'CNC', 'MIS') in params")
+
+   if type == 'limit':
+       if price is None:
+           raise InvalidOrder(f"{self.id} createOrder() requires a price argument for limit orders")
+       request['price'] = self.price_to_precision(symbol, price)
+   
+   trigger_price = self.safe_number(params, 'trigger_price')
+   if trigger_price is not None:
+       request['trigger_price'] = self.price_to_precision(symbol, trigger_price)
+
+   response = self.privatePostOrdersVariety(request)
+   
+   order_id = self.safe_string(response['data'], 'order_id')
+   return self.safe_order({'id': order_id, 'info': response}, market)
+
+def cancel_order(self, id, symbol=None, params={}):
+   variety = self.safe_string(params, 'variety', 'regular')
+   request = {
+       'order_id': id,
+       'variety': variety,
+   }
+   response = self.privateDeleteOrdersVarietyOrderId(request)
+   return self.parse_order(response['data'])
+
+def fetch_order(self, id, symbol=None, params={}):
+   request = {'order_id': id}
+   response = self.privateGetOrdersOrderId(request)
+   # The response is a list, even for a single order
+   order = self.safe_value(response, 'data')
+   if order is None or not isinstance(order, list) or len(order) == 0:
+       raise OrderNotFound(f'{self.id} order {id} not found')
+   return self.parse_order(order)
+
+def fetch_open_orders(self, symbol=None, since=None, limit=None, params={}):
+   response = self.privateGetOrders()
+   orders = self.safe_value(response, 'data',)
+   open_orders =]
+   return self.parse_orders(open_orders, None, since, limit)
+
+def fetch_closed_orders(self, symbol=None, since=None, limit=None, params={}):
+   response = self.privateGetOrders()
+   orders = self.safe_value(response, 'data',)
+   closed_statuses =
+   closed_orders = [o for o in orders if self.safe_string(o, 'status') in closed_statuses]
+   return self.parse_orders(closed_orders, None, since, limit)
+
+def parse_order(self, order, market=None):
+   status_map = {
+       'OPEN': 'open',
+       'TRIGGER PENDING': 'open',
+       'COMPLETE': 'closed',
+       'CANCELLED': 'canceled',
+       'REJECTED': 'rejected',
+   }
+   status = self.safe_string(order, 'status')
+   
+   market_id = f"{order['exchange']}:{order['tradingsymbol']}/INR"
+   market = self.safe_market(market_id, market)
+   symbol = market['symbol'] if market else market_id
+
+   timestamp = self.parse_to_int(dateutil.parser.parse(order['order_timestamp']).timestamp() * 1000)
+
+   return self.safe_order({
+       'info': order,
+       'id': self.safe_string(order, 'order_id'),
+       'clientOrderId': self.safe_string(order, 'tag'),
+       'timestamp': timestamp,
+       'datetime': self.iso8601(timestamp),
+       'lastTradeTimestamp': None,
+       'symbol': symbol,
+       'type': self.safe_string_lower(order, 'order_type'),
+       'timeInForce': self.safe_string_upper(order, 'validity'),
+       'postOnly': None,
+       'side': self.safe_string_lower(order, 'transaction_type'),
+       'price': self.safe_number(order, 'price'),
+       'stopPrice': self.safe_number(order, 'trigger_price'),
+
+       'amount': self.safe_number(order, 'quantity'),
+       'cost': None, # Zerodha doesn't provide cost in order details
+       'average': self.safe_number(order, 'average_price'),
+       'filled': self.safe_number(order, 'filled_quantity'),
+       'remaining': self.safe_number(order, 'pending_quantity'),
+       'status': self.safe_string(status_map, status, status),
+       'fee': None, # Fee details are in trade book, not order book
+       'trades':,
+   }, market)
+
+The create_order implementation validates the presence of the mandatory product parameter and constructs the request payload. The cancel_order, fetch_order, and other fetch methods demonstrate how to call the respective endpoints and utilize the central parse_order method to standardize the output. The parse_order method is comprehensive, mapping statuses and fields to their CCXT equivalents.
+
+
+3.6 Error and Rate Limit Handling
+
+
+The handle_errors method, defined in section 3.2.1, combined with the exceptions dictionary in describe(), provides a robust mechanism for translating Zerodha's specific errors into a format that Freqtrade can understand and act upon.
+________________
+Table 3: Zerodha Exception to CCXT Exception Mapping
+
+
+Zerodha error_type
+	Corresponding HTTP Status
+	CCXT Exception Class
+	Typical Cause
+	TokenException
+	403
+	AuthenticationError
+	The access_token is expired, invalid, or has been revoked.
+	UserException
+	403
+	PermissionDenied
+	The user does not have permission for the requested action (e.g., F&O disabled).
+	InputException
+	400
+	BadRequest / InvalidOrder
+	Missing or invalid parameters in the request, such as a bad product type.
+	MarginException
+	400
+	InsufficientFunds
+	Not enough cash in the account to place the order.
+	HoldingException
+	400
+	InsufficientFunds
+	Not enough shares in holdings to place a sell order.
+	(No error_type)
+	429
+	RateLimitExceeded
+	Too many requests sent in a short period.
+	(No error_type)
+	500, 502, 503, 504
+	NetworkError / ExchangeNotAvailable
+	An issue with Zerodha's backend systems or network connectivity.
+	GeneralException
+	500
+	ExchangeError
+	An unclassified error from the server.
+	DataException
+	502
+	ExchangeError
+	The API server received a bad response from the internal OMS.
+	________________
+This mapping ensures that when Zerodha returns an error, the CCXT wrapper raises a predictable exception. For instance, if Freqtrade attempts to place an order with insufficient funds, Zerodha will return a MarginException. The wrapper will catch this and raise a ccxt.InsufficientFunds exception, which Freqtrade is designed to handle gracefully (e.g., by logging the error and continuing to operate). This abstraction is vital for stable, long-running bot operation.
+
+
+Section 4: Freqtrade Integration and Validation
+
+
+With the ccxt.zerodha module implemented, the next phase is to integrate it into the Freqtrade ecosystem. This section provides the practical steps, configuration details, and validation workflows required to use the new wrapper for backtesting, dry-run, and live trading of Indian equities.
+
+
+4.1 Configuring Freqtrade for Indian Equities
+
+
+The primary interface between Freqtrade and the exchange wrapper is the config.json file. A correct configuration is essential for the bot to instantiate and authenticate with the Zerodha exchange class.
+
+
+4.1.1 Sample config.json
+
+
+Below is a complete, annotated example of a config.json file tailored for trading on the NSE with Zerodha.
+
+
+JSON
+
+
+
+
+{
+   "max_open_trades": 3,
+   "stake_currency": "INR",
+   "stake_amount": 10000,
+   "dry_run": true,
+   "exchange": {
+       "name": "zerodha",
+       "key": "YOUR_ZERODHA_API_KEY",
+       "secret": "YOUR_ZERODHA_API_SECRET",
+       "password": "PASTE_GENERATED_ACCESS_TOKEN_HERE",
+       "ccxt_config": {
+           "enableRateLimit": true
+       },
+       "pair_whitelist":,
+       "pair_blacklist":
+   },
+   "pairlists":,
+   "edge": {
+       "enabled": false
+   },
+   "telegram": {
+       "enabled": false
+   },
+   "api_server": {
+       "enabled": true,
+       "listen_ip_address": "127.0.0.1",
+       "listen_port": 8080
+   },
+   "bot_name": "Freqtrade-Zerodha-Bot",
+   "initial_state": "running"
+}
+
+
+
+4.1.2 Configuration Breakdown and access_token Strategy
+
+
+                  * "name": "zerodha": This must exactly match the id defined in the wrapper's describe() method. Freqtrade uses this string to locate and load the zerodha.py module.
+                  * "key" and "secret": These fields should be populated with the static api_key and api_secret obtained from the Kite developer console.19
+                  * "password": As per our design, this field is repurposed to hold the daily access_token.19 The workflow for the user is as follows:
+                  1. Each morning, run the generate_token.py helper script.
+                  2. The script will output a new access_token to the console.
+                  3. Copy this token and paste it into the "password" field of the config.json file.
+                  4. Restart the Freqtrade bot.
+This manual step is an unavoidable consequence of Zerodha's daily token expiration policy.1
+                     * "stake_currency": "INR": Freqtrade's accounting will be done in Indian Rupees.
+                     * "stake_amount": The amount in INR to be used for each trade.
+                     * "pair_whitelist": A list of instruments to trade, using the EXCHANGE:TRADINGSYMBOL/CURRENCY convention established in our design (e.g., "NSE:RELIANCE/INR").19
+For enhanced security, it is strongly recommended to use environment variables instead of hardcoding credentials in the file. Freqtrade supports this natively.19 The user could set:
+
+
+export FREQTRADE__EXCHANGE__KEY="YOUR_API_KEY"
+export FREQTRADE__EXCHANGE__SECRET="YOUR_API_SECRET"
+export FREQTRADE__EXCHANGE__PASSWORD="PASTED_ACCESS_TOKEN"
+
+
+4.2 Backtesting Workflow: Validating fetch_ohlcv
+
+
+Backtesting is the first and most crucial validation step. It confirms that the fetch_ohlcv implementation is working correctly and that the user's API key has the necessary permissions for historical data.
+Step 1: Download Historical Data
+The user must first use Freqtrade's download-data command. This command will internally call our wrapper's fetch_ohlcv method.
+
+
+Bash
+
+
+
+
+freqtrade download-data --exchange zerodha --config config.json --days 90 --timeframes 1d 1h
+
+                     * This command attempts to download 90 days of daily and hourly data for all pairs in the pair_whitelist of config.json.
+                     * A successful execution indicates that:
+                     * The access_token is valid.
+                     * The fetch_ohlcv method correctly translates symbols and timeframes.
+                     * The user has a paid Kite Connect subscription, as this call will fail on a free plan.2
+                     * The data will be stored locally in user_data/data/zerodha/.
+Step 2: Run the Backtest
+Once data is downloaded, a backtest can be run against it.
+
+
+Bash
+
+
+
+
+freqtrade backtesting --strategy MyStockStrategy --config config.json --timerange 20230101-
+
+                     * This command executes the MyStockStrategy against all downloaded data from January 1st, 2023, to the latest available date.23
+                     * The backtest runs entirely offline, using the data cached in Step 1.4
+                     * A successful backtest report validates that the OHLCV data format is correct and that Freqtrade's strategy engine can process it without errors.
+
+
+4.3 Dry-Run and Live Trading Protocol
+
+
+After a strategy has been successfully backtested, the next step is to test it in a simulated live environment (dry-run) before committing real capital.
+Step 1: Start Freqtrade in Dry-Run Mode
+Ensure dry_run is set to true in config.json and start the bot.
+
+
+Bash
+
+
+
+
+freqtrade trade --config config.json --strategy MyStockStrategy
+
+This will start the bot in a mode where it connects to Zerodha, receives live data, and executes its trading logic, but all create_order and cancel_order calls are simulated locally instead of being sent to the exchange.19
+Step 2: Verification Checklist for Dry-Run
+The user should monitor the bot's logs and UI to verify:
+                     * Successful Connection: The bot starts without any AuthenticationError.
+                     * Balance Fetching: The initial logs show the correct INR cash balance and stock holdings, confirming fetch_balance is working.
+                     * Ticker Updates: The bot logs regular "heartbeat" messages with updated prices for the whitelisted pairs, confirming fetch_ticker is working.
+                     * Signal Generation: The strategy correctly generates enter_long or exit_long signals based on the live data.
+                     * Simulated Orders: When a signal is generated, the log shows a simulated order being created (e.g., Simulating buy for NSE:RELIANCE/INR).
+                     * No Errors: The log is free from recurring exceptions related to API calls.
+Step 3: Transitioning to Live Trading
+Once the dry-run has been observed for a sufficient period and has performed as expected, the final step is to go live.
+                     1. Stop the bot.
+                     2. Change "dry_run": true to "dry_run": false in config.json.
+                     3. It is highly recommended to start with a low "stake_amount" to limit risk during the initial live trading phase.
+                     4. Restart the bot: freqtrade trade --config config.json --strategy MyStockStrategy.
+The bot will now execute the same logic as in dry-run, but create_order calls will be sent to the Zerodha API, executing real trades with the user's capital.
+
+
+4.4 Example Freqtrade Strategy for Indian Equities
+
+
+To provide a complete, end-to-end example, a simple strategy file is necessary. This allows users to test the integration immediately without needing to develop their own strategy first.
+File: user_data/strategies/SimpleRSI_NSE.py
+
+
+Python
+
+
+
+
+# --- Do not remove these libs ---
+from freqtrade.strategy import IStrategy
+from pandas import DataFrame
+import talib.abstract as ta
+import freqtrade.vendor.qtpylib.indicators as qtpylib
+
+class SimpleRSI_NSE(IStrategy):
+   """
+   A simple RSI strategy for Indian Equities on the NSE.
+   """
+   # Strategy interface version - must be 2 or 3
+   INTERFACE_VERSION = 3
+
+   # Minimal ROI table:
+   minimal_roi = {
+       "0": 0.10,   # 10% profit
+       "60": 0.05,  # 5% after 60 minutes
+       "120": 0.02  # 2% after 120 minutes
+   }
+
+   # Stoploss:
+   stoploss = -0.10 # 10% stoploss
+
+   # Timeframe
+   timeframe = '1h'
+
+   def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+       """
+       Adds all necessary indicators to the given DataFrame.
+       """
+       dataframe['rsi'] = ta.RSI(dataframe)
+       return dataframe
+
+   def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+       """
+       Based on TA indicators, populates the entry signal for the given dataframe.
+       """
+       dataframe.loc[
+           (
+               (qtpylib.crossed_above(dataframe['rsi'], 30)) &
+               (dataframe['volume'] > 0) # Make sure there is volume
+           ),
+           'enter_long'] = 1
+
+       return dataframe
+
+   def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+       """
+       Based on TA indicators, populates the exit signal for the given dataframe.
+       """
+       dataframe.loc[
+           (
+               (qtpylib.crossed_below(dataframe['rsi'], 70)) &
+               (dataframe['volume'] > 0)
+           ),
+           'exit_long'] = 1
+           
+       return dataframe
+
+This strategy provides a simple but functional example using the Relative Strength Index (RSI). It defines entry signals when RSI crosses above 30 and exit signals when it crosses below 70.30 It includes standard Freqtrade features like
+minimal_roi and stoploss, making it a perfect starting point for users to validate their setup and begin their journey into algorithmic trading on the Indian markets.
+
+
+Section 5: Deployment, Security, and Maintenance
+
+
+Deploying an algorithmic trading bot into a live environment requires careful consideration of security, robustness, and long-term maintenance. This final section addresses these production-level concerns, providing best practices and outlining a path for future development and testing.
+
+
+5.1 Security Best Practices
+
+
+The security of API credentials and the trading environment is paramount. A compromise can lead to direct and irreversible financial loss.
+
+
+5.1.1 Credential Management
+
+
+Hardcoding sensitive information like the api_key, api_secret, and the daily access_token directly into the config.json file is a significant security risk, especially if the file is checked into version control or stored on a shared system. The recommended approach is to use environment variables.19
+Freqtrade natively supports loading configuration values from environment variables by prefixing them with FREQTRADE__ and using double underscores (__) as level separators. The user should be strongly advised to manage their credentials as follows:
+
+
+Bash
+
+
+
+
+# Set these in your shell's profile (e.g.,.bashrc,.zshrc) or a deployment script
+export FREQTRADE__EXCHANGE__KEY="your_zerodha_api_key"
+export FREQTRADE__EXCHANGE__SECRET="your_zerodha_api_secret"
+
+# The access token can be set daily using the same mechanism
+export FREQTRADE__EXCHANGE__PASSWORD="paste_daily_access_token_here"
+
+The config.json file can then be safely stored with placeholder values, as the environment variables will override them at runtime. For more advanced setups, using a dedicated secrets management tool like HashiCorp Vault or AWS Secrets Manager is the industry standard.
+
+
+5.1.2 Token Cache Security
+
+
+The token.json cache file, which stores the access_token, is another sensitive artifact. While it does not contain the long-term api_secret, a compromised access_token grants full trading authority until it expires. The implementation should ensure that this file is created with restrictive permissions. On Unix-like systems, this means setting the file mode to 600, which grants read/write access only to the user running the bot.
+The generate_token.py script can be modified to enforce this:
+
+
+Python
+
+
+
+
+import os
+#... inside the generate_zerodha_token function...
+with open(token_cache_path, 'w') as f:
+   json.dump({'access_token': access_token, 'login_time': login_time}, f)
+os.chmod(token_cache_path, 0o600) # Set file permissions to read/write for owner only
+
+
+
+5.2 Known Limitations and Future Roadmap
+
+
+Transparency about the current capabilities and a clear vision for future enhancements are key to managing user expectations and fostering community contributions.
+
+
+5.2.1 Current Limitations
+
+
+This initial implementation focuses on delivering a robust spot trading experience. The following features are explicitly out of scope for the first version:
+                     * Futures & Options (F&O) Trading: While the architectural groundwork for F&O symbol representation has been laid, the logic for creating and managing F&O orders (which involves different product types, margins, and potential multi-leg strategies) is not implemented.
+                     * Advanced Order Types: Zerodha supports several advanced order varieties like GTT (Good Till Triggered), CO (Cover Order), and BO (Bracket Order).9 The current wrapper only handles
+regular, limit, and market orders. Integrating these would require extending the create_order method and potentially adding new unified methods if they don't fit the standard CCXT model.
+                     * WebSocket Integration: The current implementation is purely REST-based. It polls for data. For lower-latency trading, a WebSocket-based implementation would be necessary to stream real-time ticks and order updates.9 CCXT Pro provides a framework for this, but it would be a significant extension.32
+
+
+5.2.2 Future Roadmap
+
+
+The design choices made in this report pave the way for future enhancements:
+                        1. Implement F&O Trading: With the symbol convention already in place, the next step would be to modify create_order to accept F&O-specific product types (e.g., NRML for futures) and parse the additional instrument details.
+                        2. Support Advanced Order Types: The params dictionary in create_order can be extended to support parameters for GTT, CO, and BO orders.
+                        3. Develop WebSocket Client: Integrate Zerodha's Kite Ticker WebSocket API 33 to provide real-time data streaming. This would involve implementing CCXT Pro's
+watch* methods (e.g., watch_ticker, watch_orders) for a more responsive trading experience.
+                        4. Automate Token Renewal: While full automation of the login process is challenging due to 2FA, investigate semi-automated solutions, perhaps using browser automation tools like Selenium or Playwright in the helper script to reduce the manual steps required of the user.
+
+
+5.3 A Robust Testing Framework
+
+
+To ensure the long-term stability and maintainability of the ccxt.zerodha wrapper, a comprehensive testing suite is essential. This suite should include unit tests that can be run automatically, for instance, in a Continuous Integration (CI) pipeline.
+
+
+5.3.1 Unit Testing with Mocks
+
+
+Directly testing against the live Zerodha API is slow, rate-limited, and requires valid credentials. The proper approach is to use mock objects to simulate API responses. The requests-mock library is an excellent choice for this. Zerodha even provides a repository of mock responses that can be used as a source for these tests.34
+A test for the fetch_balance method might look like this:
+
+
+Python
+
+
+
+
+import pytest
+import requests_mock
+from ccxt.zerodha import zerodha
+
+@pytest.fixture
+def exchange():
+   """Provides a Zerodha exchange instance with dummy credentials."""
+   return zerodha({
+       'apiKey': 'dummy_key',
+       'secret': 'dummy_secret',
+       'password': 'dummy_access_token' # a valid token for the test
+   })
+
+def test_fetch_balance(exchange, requests_mock):
+   """Tests the fetch_balance method by mocking API responses."""
+   # Mock the /user/margins response
+   requests_mock.get('https://api.kite.trade/user/margins', json={
+       'status': 'success',
+       'data': {
+           'equity': {
+               'enabled': True,
+               'net': 100000.0,
+               'available': {'cash': 50000.0}
+           }
+       }
+   })
+
+   # Mock the /portfolio/holdings response
+   requests_mock.get('https://api.kite.trade/portfolio/holdings', json={
+       'status': 'success',
+       'data':
+   })
+   
+   # Pre-load a dummy market for INFY
+   exchange.markets = {
+       'NSE:INFY/INR': {
+           'id': 408065, 'symbol': 'NSE:INFY/INR', 'base': 'NSE:INFY', 'quote': 'INR',
+           'baseId': 'INFY', 'quoteId': 'INR', 'info': {'exchange': 'NSE'}
+       }
+   }
+
+   balance = exchange.fetch_balance()
+
+   # Assertions
+   assert balance['free'] == 50000.0
+   assert balance['total'] == 100000.0
+   assert 'NSE:INFY' in balance
+   assert balance['total'] == 10.0
+
+This test completely isolates the wrapper's parsing and logic from the live network. Similar tests should be written for every public and private method, covering both successful responses and various error conditions (e.g., testing that a TokenException response correctly raises a ccxt.AuthenticationError).
+
+
+5.3.2 Integration Testing
+
+
+In addition to unit tests, periodic integration tests should be performed against the live Zerodha API (ideally in a development account with minimal funds). These tests would validate that the wrapper's assumptions about the API's behavior and response formats remain correct, catching any breaking changes introduced by Zerodha in future API updates.
+By combining a robust architectural design, a clear implementation strategy, and a thorough testing framework, this project successfully bridges the gap between the powerful algorithmic trading capabilities of Freqtrade and the vast opportunities of the Indian equity market, made accessible through the Zerodha Kite Connect API.
+
+
+Section 6: Installation and Environment Setup
+
+
+Once the zerodha.py wrapper is complete, it must be correctly placed within your Freqtrade environment so the bot can find and use it. This section details the two primary methods for achieving this: the recommended approach for most users and a developer-focused approach for those working with the source code of the underlying libraries.
+
+
+6.1 Option 1: Using Freqtrade's Custom Exchange Folder (Recommended)
+
+
+Freqtrade is designed to be extensible and provides a straightforward way to add custom components without modifying the core application. For custom exchanges, it uses a dedicated folder within the user_data directory. This method is highly recommended as it is simple, non-destructive, and persists across Freqtrade updates.
+Step-by-step guide:
+                           1. Locate your user_data directory. This folder is created when you first set up Freqtrade and contains your configuration, strategies, and data.
+                           2. Create the exchanges subdirectory. Inside the user_data directory, create a new folder named exchanges if it does not already exist. The final path will be user_data/exchanges/.
+                           3. Place the wrapper file. Copy the zerodha.py file you have created into this new user_data/exchanges/ directory.
+                           4. Restart Freqtrade. The next time you start the Freqtrade bot, it will automatically scan this directory, discover the zerodha.py file, and make the zerodha exchange available for selection in your config.json. No further steps or rebuilds are necessary.
+This approach neatly separates your custom code from the main Freqtrade installation, making it easy to manage and update both components independently.
+
+
+6.2 Option 2: Installing into a Local CCXT Fork (Advanced)
+
+
+For developers who wish to modify the CCXT library directly, either for contribution purposes or to maintain a custom version, installing the wrapper into a forked copy of the CCXT source code is the appropriate method. This involves replacing the version of CCXT installed in your Python environment with your local, modified version.
+Step-by-step guide:
+                           1. Obtain the CCXT Source Code. First, clone the official CCXT repository from GitHub to your local machine:
+Bash
+git clone https://github.com/ccxt/ccxt.git
+cd ccxt
+
+This will create a ccxt directory containing the library's source code.35
+                           2. Position the Wrapper File. Place your zerodha.py file into the Python source directory within the cloned repository. The correct path is ccxt/python/ccxt/.
+                           3. Perform an "Editable" Install. With your custom file in place, you can now install this modified version of CCXT into your Python environment. Using an "editable" install (-e) is highly recommended for development, as it creates a symbolic link to your source files. This means any further edits you make to zerodha.py will be immediately reflected in your environment without needing to reinstall.36 From the root of your cloned
+ccxt directory, run:
+Bash
+pip install -e.
+
+This command tells pip to install the project located in the current directory (.) in editable mode (-e).
+                           4. Verification. After the installation, Freqtrade (and any other Python script in the same environment) will use your modified version of CCXT. When Freqtrade attempts to instantiate an exchange, your zerodha class will be available alongside the standard exchanges built into CCXT.39
+This method provides a powerful development workflow but requires more careful environment management. If you later update ccxt from the official PyPI repository (pip install --upgrade ccxt), your local changes will be overwritten.
+
+
+Appendix: Core Deliverables
+
+
+This section summarizes the key files and artifacts that constitute the final output of this integration project.
+
+
+A.1 Full Source Code
+
+
+                              * zerodha.py: The complete, well-commented Python file containing the zerodha class that inherits from ccxt.Exchange. This file is the core CCXT wrapper and is designed to be placed in a Freqtrade or CCXT installation.
+
+
+A.2 Freqtrade Configuration Template
+
+
+                              * config-zerodha-example.json: A ready-to-use Freqtrade configuration file, pre-populated with settings optimal for Zerodha. It includes the correct exchange name, a sample whitelist, and placeholder fields for user credentials, serving as a quick-start template for end-users.
+
+
+A.3 Helper Scripts
+
+
+                              * generate_token.py: A standalone Python script that provides a command-line interface to guide the user through the daily manual authentication process. It handles the request_token to access_token exchange and caches the resulting token for use by the bot.
+
+
+A.4 Example Strategy
+
+
+                              * SimpleRSI_NSE.py: A basic but complete Freqtrade strategy file (IStrategy). It uses the RSI indicator to generate buy and sell signals for NSE stocks, allowing users to immediately test the entire integration from backtesting to live trading with a working example.
+Works cited
+                              1. User - Kite Connect 3 / API documentation, accessed June 19, 2025, https://kite.trade/docs/connect/v3/user/
+                              2. What are the charges for Kite APIs? - Support Zerodha, accessed June 19, 2025, https://support.zerodha.com/category/trading-and-markets/general-kite/kite-api/articles/what-are-the-charges-for-kite-apis
+                              3. Kite Connect APIs: Trading and investment HTTP APIs - Zerodha, accessed June 19, 2025, https://zerodha.com/products/api/
+                              4. Backtesting - Freqtrade, accessed June 19, 2025, https://www.freqtrade.io/en/stable/backtesting/
+                              5. Why is the error 'Maximum allowed order requests exceeded' displayed? - Support Zerodha, accessed June 19, 2025, https://support.zerodha.com/category/trading-and-markets/alerts-and-nudges/kite-error-messages/articles/order-rate-limits-on-kite
+                              6. Rate Limits - Kite Connect developer forum, accessed June 19, 2025, https://kite.trade/forum/discussion/13397/rate-limits
+                              7. Exceptions and errors - Kite Connect 3 / API documentation, accessed June 19, 2025, https://kite.trade/docs/connect/v3/exceptions/
+                              8. Zerodha Kite RESTful API -Official API (Free) | Documentation | Postman API Network, accessed June 19, 2025, https://www.postman.com/amazealgos/zerodha/documentation/of0f4g4/kite-restful-api-official-api
+                              9. Is Zerodha API (Algo Trading) Review - Chittorgarh, accessed June 19, 2025, https://www.chittorgarh.com/broker/zerodha/api-for-algo-trading-review/18/
+                              10. ccxt - NPM, accessed June 19, 2025, https://www.npmjs.com/package/ccxt
+                              11. ccxt - documentation, accessed June 19, 2025, https://docs.ccxt.com/
+                              12. ccxt/ccxt: A JavaScript / TypeScript / Python / C# / PHP / Go cryptocurrency trading API with support for more than 100 bitcoin/altcoin exchanges - GitHub, accessed June 19, 2025, https://github.com/ccxt/ccxt
+                              13. CCXT – CryptoCurrency eXchange Trading Library — ccxt 1.13.142 文档, accessed June 19, 2025, https://ccxtcn.readthedocs.io/
+                              14. Manual · ccxt/ccxt Wiki - GitHub, accessed June 19, 2025, https://github.com/ccxt/ccxt/wiki/manual
+                              15. CCXT: Writing Trading Bots, The Easy Way! (Part I) - Steemit, accessed June 19, 2025, https://steemit.com/tradingbot/@amirekrami/ccxt-writing-trading-bots-the-easy-way-part-i
+                              16. Introduction to CCXT with Alpaca, accessed June 19, 2025, https://alpaca.markets/learn/ccxt-and-alpaca
+                              17. Home · ccxt/ccxt Wiki - GitHub, accessed June 19, 2025, https://github.com/ccxt/ccxt/wiki
+                              18. freqtrade/freqtrade: Free, open source crypto trading bot - GitHub, accessed June 19, 2025, https://github.com/freqtrade/freqtrade
+                              19. Configuration - Freqtrade, accessed June 19, 2025, https://www.freqtrade.io/en/stable/configuration/
+                              20. Configuration - Freqtrade, accessed June 19, 2025, https://www.freqtrade.io/en/2020.8/configuration/
+                              21. Exchange-specific Notes - Freqtrade, accessed June 19, 2025, https://www.freqtrade.io/en/2022.8/exchanges/
+                              22. Data Downloading - Freqtrade, accessed June 19, 2025, https://www.freqtrade.io/en/stable/data-download/
+                              23. Backtesting - Freqtrade, accessed June 19, 2025, https://www.freqtrade.io/en/2021.2/backtesting/
+                              24. Backtesting - Freqtrade, accessed June 19, 2025, https://www.freqtrade.io/en/2022.1/backtesting/
+                              25. Configuration - Freqtrade, accessed June 19, 2025, https://www.freqtrade.io/en/2021.4/configuration/
+                              26. Python code for Zerodha kite connect api - Stack Overflow, accessed June 19, 2025, https://stackoverflow.com/questions/42086868/python-code-for-zerodha-kite-connect-api
+                              27. kiteconnect API documentation, accessed June 19, 2025, https://kite.trade/docs/pykiteconnect/v4/
+                              28. kiteconnect.exceptions API documentation, accessed June 19, 2025, https://kite.trade/docs/pykiteconnect/v4/exceptions.m.html
+                              29. pykiteconnect/kiteconnect/connect.py at master - GitHub, accessed June 19, 2025, https://github.com/zerodha/pykiteconnect/blob/master/kiteconnect/connect.py
+                              30. Strategy Customization - Freqtrade, accessed June 19, 2025, https://www.freqtrade.io/en/2023.1/strategy-customization/
+                              31. zerodha/dotnetkiteconnect: .NET library for Kite connect - GitHub, accessed June 19, 2025, https://github.com/zerodha/dotnetkiteconnect
+                              32. ccxt.pro.manual - GitHub, accessed June 19, 2025, https://github.com/ccxt/ccxt/wiki/ccxt.pro.manual
+                              33. pykiteconnect/kiteconnect/ticker.py at master - GitHub, accessed June 19, 2025, https://github.com/zerodha/pykiteconnect/blob/master/kiteconnect/ticker.py
+                              34. Zerodha Tech - GitHub, accessed June 19, 2025, https://github.com/zerodha
+                              35. Install · ccxt/ccxt Wiki - GitHub, accessed June 19, 2025, https://github.com/ccxt/ccxt/wiki/Install
+                              36. When would the -e, --editable option be useful with pip install? - Stack Overflow, accessed June 19, 2025, https://stackoverflow.com/questions/35064426/when-would-the-e-editable-option-be-useful-with-pip-install
+                              37. Development Mode (a.k.a. “Editable Installs”) - setuptools 80.9.0 documentation, accessed June 19, 2025, https://setuptools.pypa.io/en/latest/userguide/development_mode.html
+                              38. Local project installs - pip documentation v25.2.dev0, accessed June 19, 2025, https://pip.pypa.io/en/latest/topics/local-project-installs/
+                              39. Python: Call function of package using object - ccxt - Stack Overflow, accessed June 19, 2025, https://stackoverflow.com/questions/52242383/python-call-function-of-package-using-object

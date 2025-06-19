@@ -150,6 +150,7 @@ import woofipro from  './src/woofipro.js'
 import xt from  './src/xt.js'
 import yobit from  './src/yobit.js'
 import zaif from  './src/zaif.js'
+import zerodha from './src/zerodha.js'
 import zonda from  './src/zonda.js'
 
 
@@ -333,6 +334,7 @@ const exchanges = {
     'xt':                     xt,
     'yobit':                  yobit,
     'zaif':                   zaif,
+    'zerodha':                zerodha,
     'zonda':                  zonda,
 }
 
@@ -657,6 +659,7 @@ export {
     xt,
     yobit,
     zaif,
+    zerodha,
     zonda,    
 }
 

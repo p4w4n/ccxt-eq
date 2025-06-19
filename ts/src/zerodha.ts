@@ -1,0 +1,749 @@
+//  ---------------------------------------------------------------------------
+
+import Exchange from './abstract/zerodha.js';
+import { TICK_SIZE } from './base/functions/number.js';
+import { AuthenticationError, ExchangeError, RateLimitExceeded, InvalidOrder, InsufficientFunds, BadRequest, PermissionDenied, NetworkError, ExchangeNotAvailable } from './base/errors.js';
+import { Precise } from './base/Precise.js';
+import type { TransferEntry, Int, OrderSide, OrderType, Trade, OHLCV, Order, OrderBook, Str, Ticker, OrderRequest, Balances, Tickers, Market, Strings, Currency, MarketInterface, Dict, int, FundingRateHistory, Num, Account, TradingFeeInterface, Currencies, IsolatedBorrowRate, CrossBorrowRate, IsolatedBorrowRates, CrossBorrowRates, DepositAddress, WithdrawalResponse, Transaction, DepositWithdrawFee, DepositWithdrawFeeNetwork, FundingHistory, FundingRate, FundingRates, LedgerEntry, CancellationRequest, Position, Greeks, MarginModes, MarginMode, Leverage, Leverages, Option, OptionChain, MarketMarginModes, LastPrices, LastPrice, LongShortRatio, Conversion, TradingFees, OpenInterest, OpenInterests, LeverageTier, LeverageTiers, MarginModification } from './base/types.js';
+
+//  ---------------------------------------------------------------------------
+
+/**
+ * @class zerodha
+ * @augments Exchange
+ * @description Zerodha Kite Connect API v3 implementation for CCXT
+ * 
+ * This implementation follows the comprehensive integration guide for Zerodha Kite Connect
+ * with Freqtrade. It provides a stateful session manager to handle daily token expiration
+ * and maps Indian equity trading to the CCXT unified API.
+ * 
+ * Symbol Convention: {EXCHANGE}:{TRADINGSYMBOL}/{CURRENCY}
+ * Example: NSE:INFY/INR (Infosys on NSE in Indian Rupees)
+ * 
+ * Authentication: Uses a daily-expiring access_token managed through a separate
+ * generate_token.py script due to Zerodha's manual login requirement.
+ */
+export default class zerodha extends Exchange {
+    public describe () {
+        return this.deepExtend (super.describe (), {
+            'id': 'zerodha',
+            'name': 'Zerodha',
+            'countries': [ 'IN' ], // India
+            'rateLimit': 100, // 10 requests per second = 100ms between requests
+            'version': 'v3',
+            'certified': false,
+            'pro': false,
+            'has': {
+                'CORS': undefined,
+                'spot': true,
+                'margin': false,
+                'swap': false,
+                'future': false, // Set to true when F&O is implemented
+                'option': false, // Set to true when F&O is implemented
+                'cancelOrder': true,
+                'createOrder': true,
+                'fetchBalance': true,
+                'fetchClosedOrders': true,
+                'fetchMarkets': true,
+                'fetchMyTrades': true,
+                'fetchOHLCV': true,
+                'fetchOpenOrders': true,
+                'fetchOrder': true,
+                'fetchTicker': true,
+                'fetchTickers': false, // Can be emulated with multiple fetchTicker calls
+            },
+            'timeframes': {
+                '1m': 'minute',
+                '3m': '3minute',
+                '5m': '5minute',
+                '10m': '10minute',
+                '15m': '15minute',
+                '30m': '30minute',
+                '1h': '60minute',
+                '1d': 'day',
+            },
+            'urls': {
+                'logo': 'https://zerodha.com/static/images/logo.svg',
+                'api': {
+                    'public': 'https://api.kite.trade',
+                    'private': 'https://api.kite.trade',
+                },
+                'www': 'https://zerodha.com',
+                'doc': [
+                    'https://kite.trade/docs/connect/v3/',
+                ],
+                'fees': 'https://zerodha.com/pricing',
+            },
+            'api': {
+                'public': {
+                    'get': [
+                        'instruments',
+                        'instruments/{exchange}',
+                        'quote',
+                        'quote/ltp',
+                        'quote/ohlc',
+                    ],
+                },
+                'private': {
+                    'get': [
+                        'user/profile',
+                        'user/margins',
+                        'user/margins/{segment}',
+                        'portfolio/positions',
+                        'portfolio/holdings',
+                        'orders',
+                        'orders/{order_id}',
+                        'trades',
+                        'trades/{order_id}',
+                        'instruments/historical/{instrument_token}/{interval}',
+                    ],
+                    'post': [
+                        'orders/{variety}',
+                        'orders/{variety}/{order_id}',
+                        'portfolio/positions',
+                    ],
+                    'put': [
+                        'orders/{variety}/{order_id}',
+                    ],
+                    'delete': [
+                        'orders/{variety}/{order_id}',
+                    ],
+                },
+            },
+            'fees': {
+                'trading': {
+                    'tierBased': false,
+                    'percentage': true,
+                    'maker': this.parseNumber ('0.0'),
+                    'taker': this.parseNumber ('0.0325'), // 0.0325% per side for equity delivery
+                },
+            },
+            'requiredCredentials': {
+                'apiKey': true,
+                'secret': true,
+                'password': false, // Repurposed for access_token
+                'login': false,
+                'privateKey': false,
+                'walletAddress': false,
+                'token': false,
+            },
+            'exceptions': {
+                'exact': {
+                    'TokenException': AuthenticationError,
+                    'UserException': PermissionDenied,
+                    'OrderException': InvalidOrder,
+                    'InputException': BadRequest,
+                    'MarginException': InsufficientFunds,
+                    'HoldingException': InsufficientFunds,
+                    'NetworkException': NetworkError,
+                    'DataException': ExchangeError,
+                    'GeneralException': ExchangeError,
+                },
+                'broad': {
+                    'Invalid API credentials': AuthenticationError,
+                    'Insufficient funds': InsufficientFunds,
+                    'Order not found': InvalidOrder,
+                    'Rate limit exceeded': RateLimitExceeded,
+                },
+            },
+            'precisionMode': TICK_SIZE,
+            'paddingMode': 'NO_PADDING',
+        });
+    }
+
+    async fetchMarkets (params = {}): Promise<Market[]> {
+        /**
+         * @method
+         * @name zerodha#fetchMarkets
+         * @description fetches all available trading instruments and creates unified market structure
+         * @see https://kite.trade/docs/connect/v3/market/
+         * @param {object} [params] extra parameters specific to the exchange API endpoint
+         * @returns {object[]} an array of objects representing market data
+         */
+        const response = await this.publicGetInstruments (params);
+        const markets: Market[] = [];
+        
+        for (let i = 0; i < response.length; i++) {
+            const market = response[i];
+            const exchange = this.safeString (market, 'exchange');
+            const tradingSymbol = this.safeString (market, 'tradingsymbol');
+            const instrumentType = this.safeString (market, 'instrument_type');
+            
+            // Focus on equity instruments for now (extensible to F&O later)
+            if (instrumentType === 'EQ') {
+                const id = this.safeString (market, 'instrument_token');
+                const base = exchange + ':' + tradingSymbol;
+                const quote = 'INR';
+                const symbol = base + '/' + quote;
+                
+                // Parse precision from tick_size
+                const tickSize = this.safeNumber (market, 'tick_size', 0.05);
+                const lotSize = this.safeInteger (market, 'lot_size', 1);
+                
+                markets.push ({
+                    'id': id,
+                    'symbol': symbol,
+                    'base': base,
+                    'quote': quote,
+                    'settle': undefined,
+                    'baseId': tradingSymbol,
+                    'quoteId': 'INR',
+                    'settleId': undefined,
+                    'type': 'spot',
+                    'spot': true,
+                    'margin': false,
+                    'swap': false,
+                    'future': false,
+                    'option': false,
+                    'active': true,
+                    'contract': false,
+                    'linear': undefined,
+                    'inverse': undefined,
+                    'contractSize': undefined,
+                    'expiry': undefined,
+                    'expiryDatetime': undefined,
+                    'strike': undefined,
+                    'optionType': undefined,
+                    'precision': {
+                        'amount': lotSize,
+                        'price': tickSize,
+                    },
+                    'limits': {
+                        'leverage': {
+                            'min': undefined,
+                            'max': undefined,
+                        },
+                        'amount': {
+                            'min': lotSize,
+                            'max': undefined,
+                        },
+                        'price': {
+                            'min': tickSize,
+                            'max': undefined,
+                        },
+                        'cost': {
+                            'min': undefined,
+                            'max': undefined,
+                        },
+                    },
+                    'created': undefined,
+                    'info': market,
+                });
+            }
+        }
+        
+        return markets;
+    }
+
+    async fetchTicker (symbol: string, params = {}): Promise<Ticker> {
+        /**
+         * @method
+         * @name zerodha#fetchTicker
+         * @description fetches a price ticker
+         * @see https://kite.trade/docs/connect/v3/market/
+         * @param {string} symbol unified symbol of the market to fetch the ticker for
+         * @param {object} [params] extra parameters specific to the exchange API endpoint
+         * @returns {object} a ticker structure
+         */
+        await this.loadMarkets ();
+        const market = this.market (symbol);
+        
+        // Zerodha quote endpoint expects format 'EXCHANGE:TRADINGSYMBOL'
+        const instrument = market['info']['exchange'] + ':' + market['info']['tradingsymbol'];
+        
+        const request = {
+            'i': instrument,
+        };
+        
+        const response = await this.publicGetQuote (this.extend (request, params));
+        const tickerData = this.safeValue (response['data'], instrument);
+        
+        return this.parseTicker (tickerData, market);
+    }
+
+    parseTicker (ticker: Dict, market: Market = undefined): Ticker {
+        const timestamp = this.parse8601 (this.safeString (ticker, 'timestamp'));
+        const last = this.safeNumber (ticker, 'last_price');
+        const ohlc = this.safeValue (ticker, 'ohlc', {});
+        const depth = this.safeValue (ticker, 'depth', {});
+        const buyDepth = this.safeValue (depth, 'buy', []);
+        const sellDepth = this.safeValue (depth, 'sell', []);
+        
+        const bid = (buyDepth.length > 0) ? this.safeNumber (buyDepth[0], 'price') : undefined;
+        const ask = (sellDepth.length > 0) ? this.safeNumber (sellDepth[0], 'price') : undefined;
+        const bidVolume = (buyDepth.length > 0) ? this.safeNumber (buyDepth[0], 'quantity') : undefined;
+        const askVolume = (sellDepth.length > 0) ? this.safeNumber (sellDepth[0], 'quantity') : undefined;
+        
+        const symbol = this.safeString (market, 'symbol');
+        
+        return this.safeTicker ({
+            'symbol': symbol,
+            'timestamp': timestamp,
+            'datetime': this.iso8601 (timestamp),
+            'high': this.safeNumber (ohlc, 'high'),
+            'low': this.safeNumber (ohlc, 'low'),
+            'bid': bid,
+            'bidVolume': bidVolume,
+            'ask': ask,
+            'askVolume': askVolume,
+            'vwap': undefined,
+            'open': this.safeNumber (ohlc, 'open'),
+            'close': last,
+            'last': last,
+            'previousClose': this.safeNumber (ohlc, 'close'),
+            'change': undefined,
+            'percentage': undefined,
+            'average': undefined,
+            'baseVolume': this.safeNumber (ticker, 'volume'),
+            'quoteVolume': undefined,
+            'info': ticker,
+        }, market);
+    }
+
+    async fetchOHLCV (symbol: string, timeframe = '1m', since: Int = undefined, limit: Int = undefined, params = {}): Promise<OHLCV[]> {
+        /**
+         * @method
+         * @name zerodha#fetchOHLCV
+         * @description fetches historical candlestick data
+         * @see https://kite.trade/docs/connect/v3/historical/
+         * @param {string} symbol unified symbol of the market to fetch OHLCV data for
+         * @param {string} timeframe the length of time each candle represents
+         * @param {int} [since] timestamp in ms of the earliest candle to fetch
+         * @param {int} [limit] the maximum amount of candles to fetch
+         * @param {object} [params] extra parameters specific to the exchange API endpoint
+         * @returns {int[][]} A list of candles ordered as timestamp, open, high, low, close, volume
+         */
+        await this.loadMarkets ();
+        const market = this.market (symbol);
+        
+        const request = {
+            'instrument_token': market['id'],
+            'interval': this.safeString (this.timeframes, timeframe, timeframe),
+        };
+        
+        // Calculate date range based on since and limit
+        if (since !== undefined) {
+            request['from'] = this.yyyymmdd (since, '-');
+        } else {
+            // Default to last 30 days if no since parameter
+            const now = this.milliseconds ();
+            const thirtyDaysAgo = now - (30 * 24 * 60 * 60 * 1000);
+            request['from'] = this.yyyymmdd (thirtyDaysAgo, '-');
+        }
+        
+        // Set 'to' date to today
+        request['to'] = this.yyyymmdd (this.milliseconds (), '-');
+        
+        const response = await this.privateGetInstrumentsHistoricalInstrumentTokenInterval (this.extend (request, params));
+        const candles = this.safeValue (response['data'], 'candles', []);
+        
+        return this.parseOHLCVs (candles, market, timeframe, since, limit);
+    }
+
+    parseOHLCV (ohlcv: any[], market: Market = undefined, timeframe = '1m', since: Int = undefined, limit: Int = undefined): OHLCV {
+        return [
+            this.parse8601 (ohlcv[0]),
+            this.safeNumber (ohlcv, 1), // open
+            this.safeNumber (ohlcv, 2), // high
+            this.safeNumber (ohlcv, 3), // low
+            this.safeNumber (ohlcv, 4), // close
+            this.safeNumber (ohlcv, 5), // volume
+        ];
+    }
+
+    async fetchBalance (params = {}): Promise<Balances> {
+        /**
+         * @method
+         * @name zerodha#fetchBalance
+         * @description query for balance and get the amount of funds available for trading
+         * @see https://kite.trade/docs/connect/v3/user/
+         * @see https://kite.trade/docs/connect/v3/portfolio/
+         * @param {object} [params] extra parameters specific to the exchange API endpoint
+         * @returns {object} a balance structure
+         */
+        await this.loadMarkets ();
+        
+        // Fetch both cash margins and stock holdings
+        const [marginResponse, holdingsResponse] = await Promise.all ([
+            this.privateGetUserMargins (params),
+            this.privateGetPortfolioHoldings (params),
+        ]);
+        
+        const result: Dict = {
+            'info': {
+                'margins': marginResponse,
+                'holdings': holdingsResponse,
+            },
+        };
+        
+        // Parse cash balance from margins
+        const equityMargins = this.safeValue (marginResponse['data'], 'equity');
+        if (equityMargins) {
+            const available = this.safeValue (equityMargins, 'available', {});
+            const cashAvailable = this.safeNumber (available, 'cash', 0);
+            const netBalance = this.safeNumber (equityMargins, 'net', 0);
+            
+            result['INR'] = this.account ();
+            result['INR']['free'] = cashAvailable;
+            result['INR']['total'] = netBalance;
+            result['INR']['used'] = Math.max (0, netBalance - cashAvailable);
+        }
+        
+        // Parse stock holdings
+        const holdings = this.safeValue (holdingsResponse, 'data', []);
+        for (let i = 0; i < holdings.length; i++) {
+            const holding = holdings[i];
+            const tradingSymbol = this.safeString (holding, 'tradingsymbol');
+            const exchange = this.safeString (holding, 'exchange');
+            const quantity = this.safeNumber (holding, 'quantity', 0);
+            
+            // Find the market to get unified symbol
+            const marketId = exchange + ':' + tradingSymbol + '/INR';
+            const market = this.safeMarket (marketId);
+            
+            if (market && quantity > 0) {
+                const base = market['base'];
+                result[base] = this.account ();
+                result[base]['total'] = quantity;
+                result[base]['free'] = quantity; // Assuming all holdings are free to trade
+                result[base]['used'] = 0;
+            }
+        }
+        
+        return this.safeBalance (result);
+    }
+
+    async createOrder (symbol: string, type: OrderType, side: OrderSide, amount: number, price: Num = undefined, params = {}): Promise<Order> {
+        /**
+         * @method
+         * @name zerodha#createOrder
+         * @description create a trade order
+         * @see https://kite.trade/docs/connect/v3/orders/
+         * @param {string} symbol unified symbol of the market to create an order in
+         * @param {string} type 'market' or 'limit'
+         * @param {string} side 'buy' or 'sell'
+         * @param {float} amount how much of currency you want to trade in units of base currency
+         * @param {float} [price] the price at which the order is to be fulfilled, ignored in market orders
+         * @param {object} [params] extra parameters specific to the exchange API endpoint
+         * @param {string} params.product 'CNC' for Cash and Carry, 'MIS' for Margin Intraday (REQUIRED)
+         * @param {string} [params.variety] 'regular', 'amo', 'co' (default: 'regular')
+         * @param {string} [params.validity] 'DAY', 'IOC' (default: 'DAY')
+         * @param {float} [params.trigger_price] trigger price for stop orders
+         * @returns {object} an order structure
+         */
+        await this.loadMarkets ();
+        const market = this.market (symbol);
+        
+        // Product parameter is mandatory for Zerodha
+        const product = this.safeString (params, 'product');
+        if (product === undefined) {
+            throw new InvalidOrder (this.id + ' createOrder() requires the "product" parameter (e.g., "CNC", "MIS") in params');
+        }
+        
+        const variety = this.safeString (params, 'variety', 'regular');
+        const validity = this.safeString (params, 'validity', 'DAY');
+        
+        const request = {
+            'variety': variety,
+            'tradingsymbol': market['baseId'],
+            'exchange': market['info']['exchange'],
+            'transaction_type': side.toUpperCase (),
+            'order_type': type.toUpperCase (),
+            'quantity': this.amountToPrecision (symbol, amount),
+            'product': product.toUpperCase (),
+            'validity': validity.toUpperCase (),
+        };
+        
+        if (type === 'limit') {
+            if (price === undefined) {
+                throw new InvalidOrder (this.id + ' createOrder() requires a price argument for limit orders');
+            }
+            request['price'] = this.priceToPrecision (symbol, price);
+        }
+        
+        const triggerPrice = this.safeNumber (params, 'trigger_price');
+        if (triggerPrice !== undefined) {
+            request['trigger_price'] = this.priceToPrecision (symbol, triggerPrice);
+        }
+        
+        const omitted = this.omit (params, ['product', 'variety', 'validity', 'trigger_price']);
+        const response = await this.privatePostOrdersVariety (this.extend (request, omitted));
+        
+        const orderId = this.safeString (response['data'], 'order_id');
+        return this.safeOrder ({
+            'id': orderId,
+            'info': response,
+        }, market);
+    }
+
+    async cancelOrder (id: string, symbol: Str = undefined, params = {}): Promise<Order> {
+        /**
+         * @method
+         * @name zerodha#cancelOrder
+         * @description cancels an open order
+         * @see https://kite.trade/docs/connect/v3/orders/
+         * @param {string} id order id
+         * @param {string} symbol unified symbol of the market the order was made in
+         * @param {object} [params] extra parameters specific to the exchange API endpoint
+         * @param {string} [params.variety] 'regular', 'amo', 'co' (default: 'regular')
+         * @returns {object} An order structure
+         */
+        const variety = this.safeString (params, 'variety', 'regular');
+        
+        const request = {
+            'variety': variety,
+            'order_id': id,
+        };
+        
+        const omitted = this.omit (params, ['variety']);
+        const response = await this.privateDeleteOrdersVarietyOrderId (this.extend (request, omitted));
+        
+        return this.parseOrder (response['data']);
+    }
+
+    async fetchOrder (id: string, symbol: Str = undefined, params = {}): Promise<Order> {
+        /**
+         * @method
+         * @name zerodha#fetchOrder
+         * @description fetches information on an order made by the user
+         * @see https://kite.trade/docs/connect/v3/orders/
+         * @param {string} id order id
+         * @param {string} symbol unified symbol of the market the order was made in
+         * @param {object} [params] extra parameters specific to the exchange API endpoint
+         * @returns {object} An order structure
+         */
+        const request = {
+            'order_id': id,
+        };
+        
+        const response = await this.privateGetOrdersOrderId (this.extend (request, params));
+        const orders = this.safeValue (response, 'data', []);
+        
+        if (!Array.isArray (orders) || orders.length === 0) {
+            throw new InvalidOrder (this.id + ' order ' + id + ' not found');
+        }
+        
+        return this.parseOrder (orders[0]);
+    }
+
+    async fetchOpenOrders (symbol: Str = undefined, since: Int = undefined, limit: Int = undefined, params = {}): Promise<Order[]> {
+        /**
+         * @method
+         * @name zerodha#fetchOpenOrders
+         * @description fetch all unfilled currently open orders
+         * @see https://kite.trade/docs/connect/v3/orders/
+         * @param {string} symbol unified market symbol
+         * @param {int} [since] the earliest time in ms to fetch open orders for
+         * @param {int} [limit] the maximum number of open orders structures to retrieve
+         * @param {object} [params] extra parameters specific to the exchange API endpoint
+         * @returns {Order[]} a list of order structures
+         */
+        await this.loadMarkets ();
+        
+        const response = await this.privateGetOrders (params);
+        const orders = this.safeValue (response, 'data', []);
+        
+        const openStatuses = ['OPEN', 'TRIGGER PENDING'];
+        const openOrders = orders.filter (order => openStatuses.includes (this.safeString (order, 'status')));
+        
+        return this.parseOrders (openOrders, undefined, since, limit);
+    }
+
+    async fetchClosedOrders (symbol: Str = undefined, since: Int = undefined, limit: Int = undefined, params = {}): Promise<Order[]> {
+        /**
+         * @method
+         * @name zerodha#fetchClosedOrders
+         * @description fetches information on multiple closed orders made by the user
+         * @see https://kite.trade/docs/connect/v3/orders/
+         * @param {string} symbol unified market symbol of the market orders were made in
+         * @param {int} [since] the earliest time in ms to fetch orders for
+         * @param {int} [limit] the maximum number of order structures to retrieve
+         * @param {object} [params] extra parameters specific to the exchange API endpoint
+         * @returns {Order[]} a list of order structures
+         */
+        await this.loadMarkets ();
+        
+        const response = await this.privateGetOrders (params);
+        const orders = this.safeValue (response, 'data', []);
+        
+        const closedStatuses = ['COMPLETE', 'CANCELLED', 'REJECTED'];
+        const closedOrders = orders.filter (order => closedStatuses.includes (this.safeString (order, 'status')));
+        
+        return this.parseOrders (closedOrders, undefined, since, limit);
+    }
+
+    async fetchMyTrades (symbol: Str = undefined, since: Int = undefined, limit: Int = undefined, params = {}): Promise<Trade[]> {
+        /**
+         * @method
+         * @name zerodha#fetchMyTrades
+         * @description fetch all trades made by the user
+         * @see https://kite.trade/docs/connect/v3/orders/
+         * @param {string} symbol unified market symbol
+         * @param {int} [since] the earliest time in ms to fetch trades for
+         * @param {int} [limit] the maximum number of trades structures to retrieve
+         * @param {object} [params] extra parameters specific to the exchange API endpoint
+         * @returns {Trade[]} a list of trade structures
+         */
+        await this.loadMarkets ();
+        
+        const response = await this.privateGetTrades (params);
+        const trades = this.safeValue (response, 'data', []);
+        
+        return this.parseTrades (trades, undefined, since, limit);
+    }
+
+    parseOrder (order: Dict, market: Market = undefined): Order {
+        const statusMap: Dict = {
+            'OPEN': 'open',
+            'TRIGGER PENDING': 'open',
+            'COMPLETE': 'closed',
+            'CANCELLED': 'canceled',
+            'REJECTED': 'rejected',
+        };
+        
+        const id = this.safeString (order, 'order_id');
+        const status = this.safeString (statusMap, this.safeString (order, 'status'));
+        const exchange = this.safeString (order, 'exchange');
+        const tradingSymbol = this.safeString (order, 'tradingsymbol');
+        const marketId = exchange + ':' + tradingSymbol + '/INR';
+        market = this.safeMarket (marketId, market);
+        const symbol = this.safeString (market, 'symbol');
+        
+        const timestamp = this.parse8601 (this.safeString (order, 'order_timestamp'));
+        const type = this.safeStringLower (order, 'order_type');
+        const side = this.safeStringLower (order, 'transaction_type');
+        const amount = this.safeNumber (order, 'quantity');
+        const filled = this.safeNumber (order, 'filled_quantity');
+        const remaining = this.safeNumber (order, 'pending_quantity');
+        const price = this.safeNumber (order, 'price');
+        const average = this.safeNumber (order, 'average_price');
+        const stopPrice = this.safeNumber (order, 'trigger_price');
+        
+        let cost = undefined;
+        if (filled !== undefined && average !== undefined) {
+            cost = filled * average;
+        }
+        
+        return this.safeOrder ({
+            'info': order,
+            'id': id,
+            'clientOrderId': this.safeString (order, 'tag'),
+            'timestamp': timestamp,
+            'datetime': this.iso8601 (timestamp),
+            'lastTradeTimestamp': undefined,
+            'symbol': symbol,
+            'type': type,
+            'timeInForce': this.safeStringUpper (order, 'validity'),
+            'postOnly': undefined,
+            'side': side,
+            'amount': amount,
+            'price': price,
+            'stopPrice': stopPrice,
+            'triggerPrice': stopPrice,
+            'cost': cost,
+            'average': average,
+            'filled': filled,
+            'remaining': remaining,
+            'status': status,
+            'fee': undefined, // Fee information is typically in trade data
+            'trades': [],
+        }, market);
+    }
+
+    parseTrade (trade: Dict, market: Market = undefined): Trade {
+        const id = this.safeString (trade, 'trade_id');
+        const orderId = this.safeString (trade, 'order_id');
+        const exchange = this.safeString (trade, 'exchange');
+        const tradingSymbol = this.safeString (trade, 'tradingsymbol');
+        const marketId = exchange + ':' + tradingSymbol + '/INR';
+        market = this.safeMarket (marketId, market);
+        const symbol = this.safeString (market, 'symbol');
+        
+        const timestamp = this.parse8601 (this.safeString (trade, 'fill_timestamp'));
+        const side = this.safeStringLower (trade, 'transaction_type');
+        const amount = this.safeNumber (trade, 'quantity');
+        const price = this.safeNumber (trade, 'price');
+        
+        let cost = undefined;
+        if (amount !== undefined && price !== undefined) {
+            cost = amount * price;
+        }
+        
+        return this.safeTrade ({
+            'info': trade,
+            'id': id,
+            'order': orderId,
+            'timestamp': timestamp,
+            'datetime': this.iso8601 (timestamp),
+            'symbol': symbol,
+            'type': undefined,
+            'side': side,
+            'amount': amount,
+            'price': price,
+            'cost': cost,
+            'fee': undefined, // Fee calculation would need additional data
+        }, market);
+    }
+
+    sign (path: string, api = 'public', method = 'GET', params = {}, headers: any = undefined, body: any = undefined): any {
+        let url = this.urls['api'][api] + '/' + this.implodeParams (path, params);
+        const query = this.omit (params, this.extractParams (path));
+        
+        if (api === 'private') {
+            this.checkRequiredCredentials ();
+            
+            // Check if access token is available
+            if (!this.password) {
+                throw new AuthenticationError (this.id + ' access token is missing. Please provide it in the "password" field or use the generate_token.py script.');
+            }
+            
+            headers = {
+                'X-Kite-Version': this.version,
+                'Authorization': 'token ' + this.apiKey + ':' + this.password,
+            };
+        }
+        
+        if (method === 'GET') {
+            if (Object.keys (query).length) {
+                url += '?' + this.urlencode (query);
+            }
+        } else {
+            if (Object.keys (query).length) {
+                body = this.urlencode (query);
+                headers['Content-Type'] = 'application/x-www-form-urlencoded';
+            }
+        }
+        
+        return { 'url': url, 'method': method, 'body': body, 'headers': headers };
+    }
+
+    handleErrors (code: int, reason: string, url: string, method: string, headers: Dict, body: string, response: any, requestHeaders: any, requestBody: any): any {
+        if (response === undefined) {
+            return;
+        }
+        
+        // Zerodha API returns errors in this format:
+        // {"status": "error", "message": "Error message", "error_type": "TokenException"}
+        const status = this.safeString (response, 'status');
+        if (status === 'error') {
+            const errorType = this.safeString (response, 'error_type');
+            const message = this.safeString (response, 'message');
+            const feedback = this.id + ' ' + message;
+            
+            this.throwExactlyMatchedException (this.exceptions['exact'], errorType, feedback);
+            this.throwBroadlyMatchedException (this.exceptions['broad'], message, feedback);
+            
+            throw new ExchangeError (feedback);
+        }
+        
+        // Handle rate limit errors
+        if (code === 429) {
+            throw new RateLimitExceeded (this.id + ' rate limit exceeded');
+        }
+        
+        // Handle server errors
+        if (code >= 500) {
+            throw new ExchangeNotAvailable (this.id + ' server error: ' + body);
+        }
+    }
+}
