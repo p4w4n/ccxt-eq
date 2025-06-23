@@ -3,8 +3,7 @@
 import Exchange from './abstract/zerodha.js';
 import { TICK_SIZE } from './base/functions/number.js';
 import { AuthenticationError, ExchangeError, RateLimitExceeded, InvalidOrder, InsufficientFunds, BadRequest, PermissionDenied, NetworkError, ExchangeNotAvailable } from './base/errors.js';
-import { Precise } from './base/Precise.js';
-import type { TransferEntry, Int, OrderSide, OrderType, Trade, OHLCV, Order, OrderBook, Str, Ticker, OrderRequest, Balances, Tickers, Market, Strings, Currency, MarketInterface, Dict, int, FundingRateHistory, Num, Account, TradingFeeInterface, Currencies, IsolatedBorrowRate, CrossBorrowRate, IsolatedBorrowRates, CrossBorrowRates, DepositAddress, WithdrawalResponse, Transaction, DepositWithdrawFee, DepositWithdrawFeeNetwork, FundingHistory, FundingRate, FundingRates, LedgerEntry, CancellationRequest, Position, Greeks, MarginModes, MarginMode, Leverage, Leverages, Option, OptionChain, MarketMarginModes, LastPrices, LastPrice, LongShortRatio, Conversion, TradingFees, OpenInterest, OpenInterests, LeverageTier, LeverageTiers, MarginModification } from './base/types.js';
+import type { Int, OrderSide, OrderType, Trade, OHLCV, Order, Str, Ticker, Balances, Tickers, Market, Dict, int, Num } from './base/types.js';
 
 //  ---------------------------------------------------------------------------
 
@@ -12,14 +11,14 @@ import type { TransferEntry, Int, OrderSide, OrderType, Trade, OHLCV, Order, Ord
  * @class zerodha
  * @augments Exchange
  * @description Zerodha Kite Connect API v3 implementation for CCXT
- * 
+ *
  * This implementation follows the comprehensive integration guide for Zerodha Kite Connect
  * with Freqtrade. It provides a stateful session manager to handle daily token expiration
  * and maps Indian equity trading to the CCXT unified API.
- * 
+ *
  * Symbol Convention: {EXCHANGE}:{TRADINGSYMBOL}/{CURRENCY}
  * Example: NSE:INFY/INR (Infosys on NSE in Indian Rupees)
- * 
+ *
  * Authentication: Uses a daily-expiring access_token managed through a separate
  * generate_token.py script due to Zerodha's manual login requirement.
  */
@@ -50,7 +49,7 @@ export default class zerodha extends Exchange {
                 'fetchOpenOrders': true,
                 'fetchOrder': true,
                 'fetchTicker': true,
-                'fetchTickers': false, // Can be emulated with multiple fetchTicker calls
+                'fetchTickers': true, // Emulated with multiple fetchTicker calls
             },
             'timeframes': {
                 '1m': 'minute',
@@ -162,24 +161,20 @@ export default class zerodha extends Exchange {
          */
         const response = await this.publicGetInstruments (params);
         const markets: Market[] = [];
-        
         for (let i = 0; i < response.length; i++) {
             const market = response[i];
             const exchange = this.safeString (market, 'exchange');
             const tradingSymbol = this.safeString (market, 'tradingsymbol');
             const instrumentType = this.safeString (market, 'instrument_type');
-            
             // Focus on equity instruments for now (extensible to F&O later)
             if (instrumentType === 'EQ') {
                 const id = this.safeString (market, 'instrument_token');
                 const base = exchange + ':' + tradingSymbol;
                 const quote = 'INR';
                 const symbol = base + '/' + quote;
-                
                 // Parse precision from tick_size
                 const tickSize = this.safeNumber (market, 'tick_size', 0.05);
                 const lotSize = this.safeInteger (market, 'lot_size', 1);
-                
                 markets.push ({
                     'id': id,
                     'symbol': symbol,
@@ -231,7 +226,6 @@ export default class zerodha extends Exchange {
                 });
             }
         }
-        
         return markets;
     }
 
@@ -247,17 +241,13 @@ export default class zerodha extends Exchange {
          */
         await this.loadMarkets ();
         const market = this.market (symbol);
-        
         // Zerodha quote endpoint expects format 'EXCHANGE:TRADINGSYMBOL'
         const instrument = market['info']['exchange'] + ':' + market['info']['tradingsymbol'];
-        
         const request = {
             'i': instrument,
         };
-        
         const response = await this.publicGetQuote (this.extend (request, params));
         const tickerData = this.safeValue (response['data'], instrument);
-        
         return this.parseTicker (tickerData, market);
     }
 
@@ -268,14 +258,11 @@ export default class zerodha extends Exchange {
         const depth = this.safeValue (ticker, 'depth', {});
         const buyDepth = this.safeValue (depth, 'buy', []);
         const sellDepth = this.safeValue (depth, 'sell', []);
-        
         const bid = (buyDepth.length > 0) ? this.safeNumber (buyDepth[0], 'price') : undefined;
         const ask = (sellDepth.length > 0) ? this.safeNumber (sellDepth[0], 'price') : undefined;
         const bidVolume = (buyDepth.length > 0) ? this.safeNumber (buyDepth[0], 'quantity') : undefined;
         const askVolume = (sellDepth.length > 0) ? this.safeNumber (sellDepth[0], 'quantity') : undefined;
-        
         const symbol = this.safeString (market, 'symbol');
-        
         return this.safeTicker ({
             'symbol': symbol,
             'timestamp': timestamp,
@@ -300,6 +287,50 @@ export default class zerodha extends Exchange {
         }, market);
     }
 
+    async fetchTickers (symbols: string[] = undefined, params = {}): Promise<Tickers> {
+        /**
+         * @method
+         * @name zerodha#fetchTickers
+         * @description fetches price tickers for multiple symbols
+         * Implemented by making multiple fetchTicker calls due to Zerodha API limitations
+         * @see https://kite.trade/docs/connect/v3/market/
+         * @param {string[]} [symbols] unified symbols of the markets to fetch the ticker for, all market tickers are returned if not assigned
+         * @param {object} [params] extra parameters specific to the exchange API endpoint
+         * @returns {object} a dictionary of ticker structures
+         */
+        await this.loadMarkets ();
+        if (symbols === undefined) {
+            symbols = this.symbols;
+        } else if (typeof symbols === 'string') {
+            symbols = [ symbols ];
+        }
+        // For large numbers of symbols, we should consider batching to avoid rate limits
+        // Zerodha allows 10 requests per second, so we batch the requests
+        const tickers: Dict = {};
+        // Use batch processing to respect rate limits
+        const batchSize = 8; // Conservative batch size to stay under rate limits
+        for (let i = 0; i < symbols.length; i += batchSize) {
+            const batchSymbols = symbols.slice (i, i + batchSize);
+            // Make concurrent requests for each batch
+            for (let j = 0; j < batchSymbols.length; j++) {
+                const symbol = batchSymbols[j];
+                try {
+                    const ticker = await this.fetchTicker (symbol, params);
+                    tickers[symbol] = ticker;
+                } catch (e) {
+                    // Skip symbols that fail to fetch, but continue with others
+                    // this.log ('fetch_tickers failed for symbol', symbol, e.toString ());
+                    continue;
+                }
+            }
+            // Small delay between batches to respect rate limits (100ms as per rateLimit)
+            if (i + batchSize < symbols.length) {
+                await this.sleep (100); // 100ms delay
+            }
+        }
+        return tickers;
+    }
+
     async fetchOHLCV (symbol: string, timeframe = '1m', since: Int = undefined, limit: Int = undefined, params = {}): Promise<OHLCV[]> {
         /**
          * @method
@@ -315,12 +346,10 @@ export default class zerodha extends Exchange {
          */
         await this.loadMarkets ();
         const market = this.market (symbol);
-        
         const request = {
             'instrument_token': market['id'],
             'interval': this.safeString (this.timeframes, timeframe, timeframe),
         };
-        
         // Calculate date range based on since and limit
         if (since !== undefined) {
             request['from'] = this.yyyymmdd (since, '-');
@@ -330,13 +359,10 @@ export default class zerodha extends Exchange {
             const thirtyDaysAgo = now - (30 * 24 * 60 * 60 * 1000);
             request['from'] = this.yyyymmdd (thirtyDaysAgo, '-');
         }
-        
         // Set 'to' date to today
         request['to'] = this.yyyymmdd (this.milliseconds (), '-');
-        
         const response = await this.privateGetInstrumentsHistoricalInstrumentTokenInterval (this.extend (request, params));
         const candles = this.safeValue (response['data'], 'candles', []);
-        
         return this.parseOHLCVs (candles, market, timeframe, since, limit);
     }
 
@@ -362,33 +388,28 @@ export default class zerodha extends Exchange {
          * @returns {object} a balance structure
          */
         await this.loadMarkets ();
-        
         // Fetch both cash margins and stock holdings
-        const [marginResponse, holdingsResponse] = await Promise.all ([
+        const [ marginResponse, holdingsResponse ] = await Promise.all ([
             this.privateGetUserMargins (params),
             this.privateGetPortfolioHoldings (params),
         ]);
-        
         const result: Dict = {
             'info': {
                 'margins': marginResponse,
                 'holdings': holdingsResponse,
             },
         };
-        
         // Parse cash balance from margins
         const equityMargins = this.safeValue (marginResponse['data'], 'equity');
         if (equityMargins) {
             const available = this.safeValue (equityMargins, 'available', {});
             const cashAvailable = this.safeNumber (available, 'cash', 0);
             const netBalance = this.safeNumber (equityMargins, 'net', 0);
-            
             result['INR'] = this.account ();
             result['INR']['free'] = cashAvailable;
             result['INR']['total'] = netBalance;
             result['INR']['used'] = Math.max (0, netBalance - cashAvailable);
         }
-        
         // Parse stock holdings
         const holdings = this.safeValue (holdingsResponse, 'data', []);
         for (let i = 0; i < holdings.length; i++) {
@@ -396,11 +417,9 @@ export default class zerodha extends Exchange {
             const tradingSymbol = this.safeString (holding, 'tradingsymbol');
             const exchange = this.safeString (holding, 'exchange');
             const quantity = this.safeNumber (holding, 'quantity', 0);
-            
             // Find the market to get unified symbol
             const marketId = exchange + ':' + tradingSymbol + '/INR';
             const market = this.safeMarket (marketId);
-            
             if (market && quantity > 0) {
                 const base = market['base'];
                 result[base] = this.account ();
@@ -409,7 +428,6 @@ export default class zerodha extends Exchange {
                 result[base]['used'] = 0;
             }
         }
-        
         return this.safeBalance (result);
     }
 
@@ -433,16 +451,13 @@ export default class zerodha extends Exchange {
          */
         await this.loadMarkets ();
         const market = this.market (symbol);
-        
         // Product parameter is mandatory for Zerodha
         const product = this.safeString (params, 'product');
         if (product === undefined) {
             throw new InvalidOrder (this.id + ' createOrder() requires the "product" parameter (e.g., "CNC", "MIS") in params');
         }
-        
         const variety = this.safeString (params, 'variety', 'regular');
         const validity = this.safeString (params, 'validity', 'DAY');
-        
         const request = {
             'variety': variety,
             'tradingsymbol': market['baseId'],
@@ -453,22 +468,18 @@ export default class zerodha extends Exchange {
             'product': product.toUpperCase (),
             'validity': validity.toUpperCase (),
         };
-        
         if (type === 'limit') {
             if (price === undefined) {
                 throw new InvalidOrder (this.id + ' createOrder() requires a price argument for limit orders');
             }
             request['price'] = this.priceToPrecision (symbol, price);
         }
-        
         const triggerPrice = this.safeNumber (params, 'trigger_price');
         if (triggerPrice !== undefined) {
             request['trigger_price'] = this.priceToPrecision (symbol, triggerPrice);
         }
-        
-        const omitted = this.omit (params, ['product', 'variety', 'validity', 'trigger_price']);
+        const omitted = this.omit (params, [ 'product', 'variety', 'validity', 'trigger_price' ]);
         const response = await this.privatePostOrdersVariety (this.extend (request, omitted));
-        
         const orderId = this.safeString (response['data'], 'order_id');
         return this.safeOrder ({
             'id': orderId,
@@ -489,15 +500,12 @@ export default class zerodha extends Exchange {
          * @returns {object} An order structure
          */
         const variety = this.safeString (params, 'variety', 'regular');
-        
         const request = {
             'variety': variety,
             'order_id': id,
         };
-        
-        const omitted = this.omit (params, ['variety']);
+        const omitted = this.omit (params, [ 'variety' ]);
         const response = await this.privateDeleteOrdersVarietyOrderId (this.extend (request, omitted));
-        
         return this.parseOrder (response['data']);
     }
 
@@ -515,14 +523,11 @@ export default class zerodha extends Exchange {
         const request = {
             'order_id': id,
         };
-        
         const response = await this.privateGetOrdersOrderId (this.extend (request, params));
         const orders = this.safeValue (response, 'data', []);
-        
         if (!Array.isArray (orders) || orders.length === 0) {
             throw new InvalidOrder (this.id + ' order ' + id + ' not found');
         }
-        
         return this.parseOrder (orders[0]);
     }
 
@@ -539,13 +544,10 @@ export default class zerodha extends Exchange {
          * @returns {Order[]} a list of order structures
          */
         await this.loadMarkets ();
-        
         const response = await this.privateGetOrders (params);
         const orders = this.safeValue (response, 'data', []);
-        
-        const openStatuses = ['OPEN', 'TRIGGER PENDING'];
-        const openOrders = orders.filter (order => openStatuses.includes (this.safeString (order, 'status')));
-        
+        const openStatuses = [ 'OPEN', 'TRIGGER PENDING' ];
+        const openOrders = orders.filter ((order) => openStatuses.includes (this.safeString (order, 'status')));
         return this.parseOrders (openOrders, undefined, since, limit);
     }
 
@@ -562,13 +564,10 @@ export default class zerodha extends Exchange {
          * @returns {Order[]} a list of order structures
          */
         await this.loadMarkets ();
-        
         const response = await this.privateGetOrders (params);
         const orders = this.safeValue (response, 'data', []);
-        
-        const closedStatuses = ['COMPLETE', 'CANCELLED', 'REJECTED'];
-        const closedOrders = orders.filter (order => closedStatuses.includes (this.safeString (order, 'status')));
-        
+        const closedStatuses = [ 'COMPLETE', 'CANCELLED', 'REJECTED' ];
+        const closedOrders = orders.filter ((order) => closedStatuses.includes (this.safeString (order, 'status')));
         return this.parseOrders (closedOrders, undefined, since, limit);
     }
 
@@ -585,10 +584,8 @@ export default class zerodha extends Exchange {
          * @returns {Trade[]} a list of trade structures
          */
         await this.loadMarkets ();
-        
         const response = await this.privateGetTrades (params);
         const trades = this.safeValue (response, 'data', []);
-        
         return this.parseTrades (trades, undefined, since, limit);
     }
 
@@ -600,7 +597,6 @@ export default class zerodha extends Exchange {
             'CANCELLED': 'canceled',
             'REJECTED': 'rejected',
         };
-        
         const id = this.safeString (order, 'order_id');
         const status = this.safeString (statusMap, this.safeString (order, 'status'));
         const exchange = this.safeString (order, 'exchange');
@@ -608,7 +604,6 @@ export default class zerodha extends Exchange {
         const marketId = exchange + ':' + tradingSymbol + '/INR';
         market = this.safeMarket (marketId, market);
         const symbol = this.safeString (market, 'symbol');
-        
         const timestamp = this.parse8601 (this.safeString (order, 'order_timestamp'));
         const type = this.safeStringLower (order, 'order_type');
         const side = this.safeStringLower (order, 'transaction_type');
@@ -618,12 +613,10 @@ export default class zerodha extends Exchange {
         const price = this.safeNumber (order, 'price');
         const average = this.safeNumber (order, 'average_price');
         const stopPrice = this.safeNumber (order, 'trigger_price');
-        
         let cost = undefined;
         if (filled !== undefined && average !== undefined) {
             cost = filled * average;
         }
-        
         return this.safeOrder ({
             'info': order,
             'id': id,
@@ -658,17 +651,14 @@ export default class zerodha extends Exchange {
         const marketId = exchange + ':' + tradingSymbol + '/INR';
         market = this.safeMarket (marketId, market);
         const symbol = this.safeString (market, 'symbol');
-        
         const timestamp = this.parse8601 (this.safeString (trade, 'fill_timestamp'));
         const side = this.safeStringLower (trade, 'transaction_type');
         const amount = this.safeNumber (trade, 'quantity');
         const price = this.safeNumber (trade, 'price');
-        
         let cost = undefined;
         if (amount !== undefined && price !== undefined) {
             cost = amount * price;
         }
-        
         return this.safeTrade ({
             'info': trade,
             'id': id,
@@ -688,21 +678,17 @@ export default class zerodha extends Exchange {
     sign (path: string, api = 'public', method = 'GET', params = {}, headers: any = undefined, body: any = undefined): any {
         let url = this.urls['api'][api] + '/' + this.implodeParams (path, params);
         const query = this.omit (params, this.extractParams (path));
-        
         if (api === 'private') {
             this.checkRequiredCredentials ();
-            
             // Check if access token is available
             if (!this.password) {
                 throw new AuthenticationError (this.id + ' access token is missing. Please provide it in the "password" field or use the generate_token.py script.');
             }
-            
             headers = {
                 'X-Kite-Version': this.version,
                 'Authorization': 'token ' + this.apiKey + ':' + this.password,
             };
         }
-        
         if (method === 'GET') {
             if (Object.keys (query).length) {
                 url += '?' + this.urlencode (query);
@@ -713,7 +699,6 @@ export default class zerodha extends Exchange {
                 headers['Content-Type'] = 'application/x-www-form-urlencoded';
             }
         }
-        
         return { 'url': url, 'method': method, 'body': body, 'headers': headers };
     }
 
@@ -721,7 +706,6 @@ export default class zerodha extends Exchange {
         if (response === undefined) {
             return;
         }
-        
         // Zerodha API returns errors in this format:
         // {"status": "error", "message": "Error message", "error_type": "TokenException"}
         const status = this.safeString (response, 'status');
@@ -729,18 +713,14 @@ export default class zerodha extends Exchange {
             const errorType = this.safeString (response, 'error_type');
             const message = this.safeString (response, 'message');
             const feedback = this.id + ' ' + message;
-            
             this.throwExactlyMatchedException (this.exceptions['exact'], errorType, feedback);
             this.throwBroadlyMatchedException (this.exceptions['broad'], message, feedback);
-            
             throw new ExchangeError (feedback);
         }
-        
         // Handle rate limit errors
         if (code === 429) {
             throw new RateLimitExceeded (this.id + ' rate limit exceeded');
         }
-        
         // Handle server errors
         if (code >= 500) {
             throw new ExchangeNotAvailable (this.id + ' server error: ' + body);

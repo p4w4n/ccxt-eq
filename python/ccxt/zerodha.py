@@ -7,6 +7,8 @@ from datetime import datetime, time
 import pytz
 
 from ccxt.base.exchange import Exchange
+from ccxt.base.precise import Precise
+from ccxt.base.decimal_to_precision import TICK_SIZE, NO_PADDING
 from ccxt.base.errors import (
     ExchangeError,
     AuthenticationError,
@@ -18,9 +20,10 @@ from ccxt.base.errors import (
     NetworkError,
     ExchangeNotAvailable
 )
+from ccxt.abstract.zerodha import ImplicitAPI
 
 
-class zerodha(Exchange):
+class zerodha(Exchange, ImplicitAPI):
     """
     Zerodha Kite Connect API v3 implementation for CCXT
     
@@ -86,7 +89,7 @@ class zerodha(Exchange):
                 'fetchPositions': False,
                 'fetchPremiumIndexOHLCV': False,
                 'fetchTicker': True,
-                'fetchTickers': False,  # Can be emulated with multiple fetchTicker calls
+                'fetchTickers': True,  # Emulated with multiple fetchTicker calls
                 'fetchTime': False,
                 'fetchTrades': False,
                 'fetchTradingFee': False,
@@ -98,6 +101,30 @@ class zerodha(Exchange):
                 'setMarginMode': False,
                 'transfer': False,
                 'withdraw': False,
+            },
+            'features': {
+                'spot': {
+                    'fetchOHLCV': {
+                        'limit': 1000,  # Zerodha allows up to 1000 candles per request
+                    },
+                    'fetchTicker': {
+                        'limit': 1000,
+                    },
+                    'fetchTickers': {
+                        'limit': 1000,
+                    },
+                },
+                'futures': {
+                    'fetchOHLCV': {
+                        'limit': 1000,
+                    },
+                    'fetchTicker': {
+                        'limit': 1000,
+                    },
+                    'fetchTickers': {
+                        'limit': 1000,
+                    },
+                },
             },
             'timeframes': {
                 '1m': 'minute',
@@ -166,9 +193,9 @@ class zerodha(Exchange):
                 },
             },
             'requiredCredentials': {
-                'apiKey': True,
-                'secret': True,
-                'password': False,  # Repurposed for access_token
+                'apiKey': False,  # Can be loaded from cache
+                'secret': False,  # Not needed for session-based auth
+                'password': False,  # Repurposed for access_token, can be loaded from cache
                 'login': False,
                 'privateKey': False,
                 'walletAddress': False,
@@ -193,36 +220,37 @@ class zerodha(Exchange):
                     'Rate limit exceeded': RateLimitExceeded,
                 },
             },
-            'precisionMode': self.TICK_SIZE,
-            'paddingMode': self.NO_PADDING,
+            'precisionMode': TICK_SIZE,
+            'paddingMode': NO_PADDING,
         })
 
     def __init__(self, config={}):
         super(zerodha, self).__init__(config)
-        self.token_cache_path = Path.home() / '.cache' / 'ccxt-zerodha' / 'token.json'
+        self.token_cache_path = Path.home() / '.cache' / 'ccxt-zerodha' / 'session.json'
         self.token_cache_path.parent.mkdir(parents=True, exist_ok=True)
         # The 'password' field from config is repurposed for the access_token
         self.access_token = self.password
         self.login_time = None
+        
+        # Load credentials from cache if not provided in config
+        if not self.apiKey or not self.access_token:
+            self._load_credentials_from_cache()
 
-    def _load_access_token(self):
-        """Loads access token from instance, then from cache."""
-        if self.access_token:
-            # Token provided in config, assume it's fresh
-            return
-
-        if self.token_cache_path.exists():
-            try:
+    def _load_credentials_from_cache(self):
+        """Load credentials from the cached token file"""
+        try:
+            if self.token_cache_path.exists():
                 with open(self.token_cache_path, 'r') as f:
                     token_data = json.load(f)
-                    self.access_token = token_data.get('access_token')
-                    login_time_str = token_data.get('login_time')
-                    if login_time_str:
-                        # Zerodha times are in IST
-                        self.login_time = datetime.fromisoformat(login_time_str.replace('Z', '+05:30'))
-            except (json.JSONDecodeError, IOError, ValueError):
-                self.access_token = None
-                self.login_time = None
+                    if not self.apiKey:
+                        self.apiKey = token_data.get('api_key')
+                    if not self.access_token:
+                        self.access_token = token_data.get('access_token')
+                    if not self.login_time and token_data.get('login_time'):
+                        self.login_time = self.parse8601(token_data.get('login_time'))
+        except Exception as e:
+            # Silently fail if cache loading fails
+            pass
 
     def _is_token_expired(self):
         """Checks if the access token has expired (past 6 AM IST next day)."""
@@ -249,81 +277,181 @@ class zerodha(Exchange):
 
     def fetch_markets(self, params={}):
         """
-        Fetches all available trading instruments and creates unified market structure
-        Uses cached CSV file from Zerodha's instruments endpoint for efficiency
-        
+        retrieves data on all markets for zerodha
         @param {dict} params extra parameters specific to the exchange API endpoint
-        @returns {list} an array of objects representing market data
+        @returns {dict} an array of objects representing market data
         """
-        response = self.public_get_instruments(params)
+        response = self.publicGetInstruments(params)
         markets = []
         
-        for market_data in response:
-            exchange = self.safe_string(market_data, 'exchange')
-            trading_symbol = self.safe_string(market_data, 'tradingsymbol')
-            instrument_type = self.safe_string(market_data, 'instrument_type')
+        # Handle CSV response - Zerodha returns CSV data
+        if isinstance(response, str):
+            # Parse CSV response
+            import csv
+            import io
             
-            # Focus on equity instruments for now (extensible to F&O later)
-            if instrument_type == 'EQ':
-                id = self.safe_string(market_data, 'instrument_token')
-                base = exchange + ':' + trading_symbol
-                quote = 'INR'
-                symbol = base + '/' + quote
-                
-                # Parse precision from tick_size
-                tick_size = self.safe_number(market_data, 'tick_size', 0.05)
-                lot_size = self.safe_integer(market_data, 'lot_size', 1)
-                
-                market = {
-                    'id': id,
-                    'symbol': symbol,
-                    'base': base,
-                    'quote': quote,
-                    'settle': None,
-                    'baseId': trading_symbol,
-                    'quoteId': 'INR',
-                    'settleId': None,
-                    'type': 'spot',
-                    'spot': True,
-                    'margin': False,
-                    'swap': False,
-                    'future': False,
-                    'option': False,
-                    'active': True,
-                    'contract': False,
-                    'linear': None,
-                    'inverse': None,
-                    'contractSize': None,
-                    'expiry': None,
-                    'expiryDatetime': None,
-                    'strike': None,
-                    'optionType': None,
-                    'precision': {
-                        'amount': lot_size,
-                        'price': tick_size,
-                    },
-                    'limits': {
-                        'leverage': {
-                            'min': None,
-                            'max': None,
-                        },
-                        'amount': {
-                            'min': lot_size,
-                            'max': None,
-                        },
-                        'price': {
-                            'min': tick_size,
-                            'max': None,
-                        },
-                        'cost': {
-                            'min': None,
-                            'max': None,
-                        },
-                    },
-                    'created': None,
-                    'info': market_data,
-                }
-                markets.append(market)
+            # Split by lines and parse each line
+            lines = response.strip().split('\n')
+            if len(lines) < 2:  # Need at least header + 1 data row
+                return markets
+            
+            # Parse header
+            header = lines[0].split(',')
+            
+            # Parse data rows
+            for line in lines[1:]:
+                try:
+                    # Split by comma, but handle quoted fields properly
+                    row = list(csv.reader([line]))[0]
+                    
+                    # Create market data dict
+                    market_data = {}
+                    for i, field in enumerate(row):
+                        if i < len(header):
+                            market_data[header[i]] = field
+                    
+                    # Process the market data
+                    exchange = market_data.get('exchange', '')
+                    trading_symbol = market_data.get('tradingsymbol', '')
+                    instrument_type = market_data.get('instrument_type', '')
+                    
+                    # Focus on equity instruments for now (extensible to F&O later)
+                    if instrument_type == 'EQ':
+                        id = market_data.get('instrument_token', '')
+                        tick_size = float(market_data.get('tick_size', 0.05))
+                        lot_size = int(market_data.get('lot_size', 1))
+                        
+                        # Skip if no instrument token
+                        if not id:
+                            continue
+                        
+                        base = exchange + ':' + trading_symbol
+                        quote = 'INR'
+                        symbol = base + '/' + quote
+                        
+                        market = {
+                            'id': id,
+                            'symbol': symbol,
+                            'base': base,
+                            'quote': quote,
+                            'settle': None,
+                            'baseId': trading_symbol,
+                            'quoteId': 'INR',
+                            'settleId': None,
+                            'type': 'spot',
+                            'spot': True,
+                            'margin': False,
+                            'swap': False,
+                            'future': False,
+                            'option': False,
+                            'active': True,
+                            'contract': False,
+                            'linear': None,
+                            'inverse': None,
+                            'contractSize': None,
+                            'expiry': None,
+                            'expiryDatetime': None,
+                            'strike': None,
+                            'optionType': None,
+                            'precision': {
+                                'amount': lot_size,
+                                'price': tick_size,
+                            },
+                            'limits': {
+                                'leverage': {
+                                    'min': None,
+                                    'max': None,
+                                },
+                                'amount': {
+                                    'min': lot_size,
+                                    'max': None,
+                                },
+                                'price': {
+                                    'min': tick_size,
+                                    'max': None,
+                                },
+                                'cost': {
+                                    'min': None,
+                                    'max': None,
+                                },
+                            },
+                            'created': None,
+                            'info': market_data,
+                        }
+                        markets.append(market)
+                        
+                except Exception as e:
+                    # Log error but continue processing other markets
+                    self.log(f"Error processing market data line: {e}")
+                    continue
+        else:
+            # Handle JSON response (fallback)
+            for instrument in response:
+                try:
+                    # Parse the instrument data
+                    instrument_token = str(instrument.get('instrument_token', ''))
+                    tradingsymbol = instrument.get('tradingsymbol', '')
+                    name = instrument.get('name', '')
+                    instrument_type = instrument.get('instrument_type', '')
+                    exchange = instrument.get('exchange', '')
+                    segment = instrument.get('segment', '')
+                    
+                    # Skip if essential fields are missing
+                    if not instrument_token or not tradingsymbol or not exchange:
+                        continue
+                    
+                    # Determine the base and quote currencies
+                    if instrument_type == 'EQ':
+                        # For equity, the symbol is the base currency
+                        base = tradingsymbol
+                        quote = 'INR'
+                    elif instrument_type in ['FUT', 'OPT']:
+                        # For futures/options, extract the underlying
+                        base = tradingsymbol.split('-')[0] if '-' in tradingsymbol else tradingsymbol
+                        quote = 'INR'
+                    else:
+                        # For other instruments, use the symbol as base
+                        base = tradingsymbol
+                        quote = 'INR'
+                    
+                    # Create the market ID
+                    market_id = f"{base}/{quote}"
+                    
+                    # Create market object
+                    market = {
+                        'id': instrument_token,
+                        'symbol': market_id,
+                        'base': base,
+                        'quote': quote,
+                        'settle': None,
+                        'baseId': tradingsymbol,
+                        'quoteId': 'INR',
+                        'settleId': None,
+                        'type': 'spot' if instrument_type == 'EQ' else 'future' if instrument_type == 'FUT' else 'option',
+                        'spot': instrument_type == 'EQ',
+                        'margin': False,
+                        'swap': False,
+                        'future': instrument_type == 'FUT',
+                        'option': instrument_type == 'OPT',
+                        'active': True,
+                        'contract': instrument_type in ['FUT', 'OPT'],
+                        'linear': True,
+                        'inverse': False,
+                        'contractSize': 1,
+                        'expiry': None,
+                        'expiryDatetime': None,
+                        'strike': None,
+                        'optionType': None,
+                        'settlementType': None,
+                        'feeLoaded': False,
+                        'info': instrument,
+                    }
+                    
+                    markets.append(market)
+                    
+                except Exception as e:
+                    # Skip malformed data
+                    continue
         
         return markets
 
@@ -345,7 +473,7 @@ class zerodha(Exchange):
             'i': instrument,
         }
         
-        response = self.private_get_quote(self.extend(request, params))
+        response = self.public_get_quote(self.extend(request, params))
         ticker_data = self.safe_value(response['data'], instrument)
         
         return self.parse_ticker(ticker_data, market)
@@ -394,6 +522,48 @@ class zerodha(Exchange):
             'quoteVolume': None,
             'info': ticker,
         }, market)
+
+    def fetch_tickers(self, symbols=None, params={}):
+        """
+        Fetches price tickers for multiple symbols
+        Implemented by making multiple fetchTicker calls due to Zerodha API limitations
+        
+        @param {list} symbols list of unified symbols to fetch tickers for, if None fetches all
+        @param {dict} params extra parameters specific to the exchange API endpoint
+        @returns {dict} a dictionary of ticker structures
+        """
+        self.load_markets()
+        
+        if symbols is None:
+            symbols = list(self.symbols)
+        elif isinstance(symbols, str):
+            symbols = [symbols]
+        
+        # For large numbers of symbols, we should consider batching to avoid rate limits
+        # Zerodha allows 10 requests per second, so we batch the requests
+        tickers = {}
+        
+        # Use batch processing to respect rate limits
+        batch_size = 8  # Conservative batch size to stay under rate limits
+        for i in range(0, len(symbols), batch_size):
+            batch_symbols = symbols[i:i + batch_size]
+            
+            # Make concurrent requests for each batch
+            batch_results = []
+            for symbol in batch_symbols:
+                try:
+                    ticker = self.fetch_ticker(symbol, params)
+                    tickers[symbol] = ticker
+                except Exception as e:
+                    # Skip symbols that fail to fetch, but continue with others
+                    self.log('fetch_tickers failed for symbol', symbol, str(e))
+                    continue
+            
+            # Small delay between batches to respect rate limits (100ms as per rateLimit)
+            if i + batch_size < len(symbols):
+                self.sleep(0.1)  # 100ms delay
+        
+        return tickers
 
     def fetch_ohlcv(self, symbol, timeframe='1m', since=None, limit=None, params={}):
         """
@@ -760,32 +930,20 @@ class zerodha(Exchange):
         }, market)
 
     def sign(self, path, api='public', method='GET', params={}, headers=None, body=None):
-        """
-        Signs API requests with proper authentication headers
-        
-        @param {str} path request path
-        @param {str} api 'public' or 'private'
-        @param {str} method HTTP method
-        @param {dict} params request parameters
-        @param {dict} headers request headers
-        @param {str} body request body
-        @returns {dict} signed request object
-        """
+        """Sign the request with session-based authentication"""
         url = self.urls['api'][api] + '/' + self.implode_params(path, params)
         query = self.omit(params, self.extract_params(path))
         
-        if api == 'private':
-            self.check_required_credentials()
-            self._load_access_token()
-            
-            # Check if access token is available and not expired
-            if not self.access_token or self._is_token_expired():
-                raise AuthenticationError(self.id + ' access token is missing or expired. Please provide it in the "password" field or use the zerodha_generate_token.py script.')
-            
-            headers = {
-                'X-Kite-Version': self.version,
-                'Authorization': 'token ' + self.apiKey + ':' + self.access_token,
-            }
+        # Always add auth headers for quote endpoints
+        if api == 'private' or path in ['quote', 'quote/ltp', 'quote/ohlc']:
+            if not self.apiKey or not self.access_token:
+                self._load_credentials_from_cache()
+            if not self.apiKey or not self.access_token:
+                raise AuthenticationError(self.id + ' requires apiKey and access_token for authentication')
+            if headers is None:
+                headers = {}
+            headers['X-KiteConnect-ApiKey'] = self.apiKey
+            headers['Authorization'] = f'token {self.apiKey}:{self.access_token}'
         
         if method == 'GET':
             if query:
@@ -793,6 +951,8 @@ class zerodha(Exchange):
         else:
             if query:
                 body = self.urlencode(query)
+                if headers is None:
+                    headers = {}
                 headers['Content-Type'] = 'application/x-www-form-urlencoded'
         
         return {'url': url, 'method': method, 'body': body, 'headers': headers}

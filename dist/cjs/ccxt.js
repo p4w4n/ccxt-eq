@@ -116,6 +116,7 @@ var woofipro = require('./src/woofipro.js');
 var xt = require('./src/xt.js');
 var yobit = require('./src/yobit.js');
 var zaif = require('./src/zaif.js');
+var zerodha = require('./src/zerodha.js');
 var zonda = require('./src/zonda.js');
 var alpaca$1 = require('./src/pro/alpaca.js');
 var apex$1 = require('./src/pro/apex.js');
@@ -300,6 +301,7 @@ const exchanges = {
     'xt': xt,
     'yobit': yobit,
     'zaif': zaif,
+    'zerodha': zerodha,
     'zonda': zonda,
 };
 const pro = {
@@ -531,6 +533,7 @@ exports.woofipro = woofipro;
 exports.xt = xt;
 exports.yobit = yobit;
 exports.zaif = zaif;
+exports.zerodha = zerodha;
 exports.zonda = zonda;
 exports["default"] = ccxt;
 exports.exchanges = exchanges;

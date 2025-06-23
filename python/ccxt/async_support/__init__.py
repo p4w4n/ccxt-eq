@@ -167,6 +167,7 @@ from ccxt.async_support.woofipro import woofipro                                
 from ccxt.async_support.xt import xt                                            # noqa: F401
 from ccxt.async_support.yobit import yobit                                      # noqa: F401
 from ccxt.async_support.zaif import zaif                                        # noqa: F401
+from ccxt.async_support.zerodha import zerodha                                  # noqa: F401
 from ccxt.async_support.zonda import zonda                                      # noqa: F401
 
 exchanges = [
@@ -274,6 +275,7 @@ exchanges = [
     'xt',
     'yobit',
     'zaif',
+    'zerodha',
     'zonda',
 ]
 

@@ -21,4 +21,4 @@ class ImplicitAPI:
     private_post_orders_variety_order_id = privatePostOrdersVarietyOrderId = Entry('orders/{variety}/{order_id}', 'private', 'POST', {})
     private_post_portfolio_positions = privatePostPortfolioPositions = Entry('portfolio/positions', 'private', 'POST', {})
     private_put_orders_variety_order_id = privatePutOrdersVarietyOrderId = Entry('orders/{variety}/{order_id}', 'private', 'PUT', {})
-    private_delete_orders_variety_order_id = privateDeleteOrdersVarietyOrderId = Entry('orders/{variety}/{order_id}', 'private', 'DELETE', {}) 
+    private_delete_orders_variety_order_id = privateDeleteOrdersVarietyOrderId = Entry('orders/{variety}/{order_id}', 'private', 'DELETE', {})

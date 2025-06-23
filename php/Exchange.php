@@ -441,6 +441,7 @@ class Exchange {
         'xt',
         'yobit',
         'zaif',
+        'zerodha',
         'zonda',
     );
 
